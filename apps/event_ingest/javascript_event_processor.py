@@ -201,16 +201,21 @@ class JavascriptEventProcessor:
     def find_source_files(self, frame, debug_id_map):
         minified_filename = frame.abs_path.split("/")[-1] if frame.abs_path else ""
         debug_id = debug_id_map.get(minified_filename)
-        for debug_bundle in self.debug_bundles:
-            # Match by debug_id if both have it
-            if (
-                debug_id
-                and debug_bundle.debug_id
-                and str(debug_id) == str(debug_bundle.debug_id)
-            ):
-                return debug_bundle.file, debug_bundle.sourcemap_file
 
-            # Fallback to matching by filename
+        # Prefer Debug ID matches across *all* candidates before any filename
+        # fallback. RN/Hermes always uses the same minified name
+        # (index.android.bundle / main.jsbundle), so falling through to
+        # filename in the same loop lets native release maps win over the
+        # correct OTA artifact bundle.
+        if debug_id:
+            for debug_bundle in self.debug_bundles:
+                if (
+                    debug_bundle.debug_id
+                    and str(debug_id) == str(debug_bundle.debug_id)
+                ):
+                    return debug_bundle.file, debug_bundle.sourcemap_file
+
+        for debug_bundle in self.debug_bundles:
             file_name = debug_bundle.file.name
             code_file = debug_bundle.data.get("code_file")
             if code_file:  # Get name, not full path
