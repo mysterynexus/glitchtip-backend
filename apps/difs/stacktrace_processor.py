@@ -3,7 +3,6 @@ import copy
 import logging
 import zipfile
 
-import cxxfilt
 from symbolic import Archive, ProguardMapper, SymCache, normalize_debug_id, parse_addr
 
 alternative_arch = {"x86": ["x86", "x86_64"]}
@@ -321,14 +320,8 @@ class StacktraceProcessor:
                     inline_frame["filename"] = sym.full_path
                     inline_frame["abs_path"] = sym.full_path
                     inline_frame["lineno"] = sym.line
-                    try:
-                        from rust_demangler import demangle as rust_demangle
-                        inline_frame["function"] = rust_demangle(sym.symbol)
-                    except Exception:
-                        try:
-                            inline_frame["function"] = cxxfilt.demangle(sym.symbol)
-                        except cxxfilt.InvalidName:
-                            inline_frame["function"] = sym.symbol
+                    from gt_rust.symbolic import demangle
+                    inline_frame["function"] = demangle(sym.symbol)
                     score = score + 1
 
                     # Extract source context from source bundle if available
