@@ -17,7 +17,6 @@ dependencies = [
     "uWSGI~=2.0",
     "whitenoise~=6.0",
     "sentry-sdk~=2.20",
-    "cxxfilt~=0.3.0",
     "django-anymail~=15.0",
     "user-agents~=2.1",
     "django-ipware~=7.0",
