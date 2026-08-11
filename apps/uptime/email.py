@@ -46,8 +46,13 @@ class MonitorEmail(DetailEmail):
             f"{base_url}/{org.slug}/settings/projects/{project.slug}"
         )
 
-        if self.object.reason:
-            context["reason"] = self.object.get_reason_display
+        # Not ``if self.object.reason``: UNKNOWN is 0, so the old truthiness
+        # test silently dropped the reason for every unknown failure. And the
+        # rendered string is assigned rather than the bound method -- templates
+        # happen to call callables, but anything else reading this context got
+        # a method object.
+        if reason_text := self.object.get_reason_text():
+            context["reason"] = reason_text
 
         context["start_check"] = self.object.start_check
 

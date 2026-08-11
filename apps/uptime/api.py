@@ -4,6 +4,8 @@ from uuid import UUID
 from asgiref.sync import sync_to_async
 from django.db import connection
 from django.db.models import Prefetch
+from django.db.models.fields.json import KeyTextTransform
+from django.db.models.functions import Left
 from django.http import Http404, HttpRequest, HttpResponse
 from django.shortcuts import aget_object_or_404
 from ninja import Router, Status
@@ -14,6 +16,7 @@ from apps.projects.models import Project
 from glitchtip.api.authentication import AuthHttpRequest
 from glitchtip.api.pagination import AsyncLinkHeaderPagination
 
+from .constants import MONITOR_CHECK_DETAIL_KEY, MONITOR_CHECK_DETAIL_MAX_LENGTH
 from .models import Monitor, MonitorCheck, StatusPage
 from .schema import (
     MonitorCheckResponseTimeSchema,
@@ -107,13 +110,18 @@ async def fetch_checks_lateral(
     if not monitor_ids:
         return {}
 
+    # ``data ->> 'detail'`` rather than ``data`` itself: the column can also
+    # hold up to 500 KB of response body (see PAYLOAD_SAVE_LIMIT), which no
+    # schema exposes, and selecting it de-TOASTs and ships that for every one
+    # of the ``limit`` checks of every monitor.
     sql = """
         SELECT c.id, c.organization_id, c.monitor_id,
-               c.response_time, c.reason, c.is_up, c.is_change, c.data
+               c.response_time, c.reason, c.is_up, c.is_change, c.reason_detail
         FROM unnest(%(monitor_ids)s::int[]) AS m(id)
         CROSS JOIN LATERAL (
             SELECT id, organization_id, monitor_id,
-                   response_time, reason, is_up, is_change, data
+                   response_time, reason, is_up, is_change,
+                   left(data ->> 'detail', %(detail_max)s) AS reason_detail
             FROM uptime_monitorcheck
             WHERE monitor_id = m.id AND organization_id = %(organization_id)s
             ORDER BY id DESC
@@ -130,6 +138,7 @@ async def fetch_checks_lateral(
                     "monitor_ids": monitor_ids,
                     "organization_id": organization_id,
                     "limit": limit,
+                    "detail_max": MONITOR_CHECK_DETAIL_MAX_LENGTH,
                 },
             )
             columns = [col[0] for col in cursor.description]
@@ -147,8 +156,10 @@ async def fetch_checks_lateral(
             reason=row["reason"],
             is_up=row["is_up"],
             is_change=row["is_change"],
-            data=row["data"],
         )
+        # Assigned after construction: Model.__init__ rejects kwargs that are
+        # not fields. MonitorCheck.get_reason_detail reads this alias.
+        check.reason_detail = row["reason_detail"]
         checks_by_monitor[row["monitor_id"]].append(check)
 
     return dict(checks_by_monitor)
@@ -347,6 +358,14 @@ async def list_monitor_checks(
             monitor__organization__users=request.auth.user_id,
         )
         .only("is_up", "reason", "response_time")
+        # ``data ->> 'detail'`` rather than adding ``data`` to .only(): the
+        # column can also hold a 500 KB response body that no schema exposes.
+        .annotate(
+            reason_detail=Left(
+                KeyTextTransform(MONITOR_CHECK_DETAIL_KEY, "data"),
+                MONITOR_CHECK_DETAIL_MAX_LENGTH,
+            )
+        )
         # By the partition key, so paging deeper walks partitions newest-first
         # instead of re-opening every one per page. See MonitorCheck.Meta.
         .order_by("-id")

@@ -24,10 +24,19 @@ class MonitorCheckSchema(CamelSchema, ModelSchema):
     # check's start time is stored. Declared explicitly so the response shape
     # is unchanged for API clients.
     start_check: datetime
+    # What actually went wrong ("Received HTTP 503, expected 200"), where
+    # ``reason`` says only which kind of failure it was. Not a column either --
+    # see MonitorCheck.get_reason_detail. Only the detail is exposed, never the
+    # ``data`` column it lives in: that can also hold a 500 KB response body.
+    reason_detail: str | None = None
 
     class Meta:
         model = MonitorCheck
         fields = ["is_up", "reason"]
+
+    @staticmethod
+    def resolve_reason_detail(obj):
+        return obj.get_reason_detail()
 
 
 class MonitorCheckResponseTimeSchema(MonitorCheckSchema, ModelSchema):

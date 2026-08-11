@@ -316,6 +316,44 @@ class UptimeAPITestCase(GlitchTestCase):
         self.assertContains(res, "2021-09-19T15:39:31Z")
 
     @mock.patch("apps.uptime.tasks.perform_checks")
+    async def test_reason_detail_is_exposed_but_payload_is_not(self, _):
+        """Both read paths project data->>'detail' rather than the column.
+
+        ``data`` can also hold up to 500 KB of untrusted response body, which no
+        schema exposes -- neither the LATERAL join used by the monitor
+        endpoints nor the annotation used by the checks list may leak it.
+        """
+        monitor = await baker.amake(
+            "uptime.Monitor",
+            organization=self.organization,
+            url="http://example.com",
+        )
+        await baker.amake(
+            "uptime.MonitorCheck",
+            monitor=monitor,
+            organization=monitor.organization,
+            is_up=False,
+            reason=2,
+            data={"detail": "Received HTTP 503, expected 200", "payload": "y" * 1000},
+            id=UUID7Helper.from_datetime(parse_datetime("2021-09-19T15:39:31Z")),
+        )
+
+        for url in (
+            reverse(
+                "api:list_monitor_checks", args=[self.organization.slug, monitor.pk]
+            ),
+            reverse("api:get_monitor", args=[self.organization.slug, monitor.pk]),
+        ):
+            with self.subTest(url=url):
+                res = await self.async_client.get(url)
+                data = res.json()
+                check = data[0] if isinstance(data, list) else data["checks"][0]
+                self.assertEqual(
+                    check["reasonDetail"], "Received HTTP 503, expected 200"
+                )
+                self.assertNotIn("y" * 20, res.content.decode())
+
+    @mock.patch("apps.uptime.tasks.perform_checks")
     async def test_monitor_checks_is_change_baseline(self, _):
         """When all is_change=True records have been pruned (e.g. partition
         retention on a 100% uptime monitor), the is_change=true filter should

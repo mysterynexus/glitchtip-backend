@@ -11,7 +11,13 @@ from django_extensions.db.fields import AutoSlugField
 from glitchtip.base_models import CreatedModel
 from glitchtip.partition_manager import UUID7Helper
 
-from .constants import HTTP_MONITOR_TYPES, MonitorCheckReason, MonitorType
+from .constants import (
+    HTTP_MONITOR_TYPES,
+    MONITOR_CHECK_DETAIL_KEY,
+    MONITOR_CHECK_DETAIL_MAX_LENGTH,
+    MonitorCheckReason,
+    MonitorType,
+)
 
 
 class MonitorManager(models.Manager):
@@ -222,6 +228,40 @@ class MonitorCheck(models.Model):
         if self.is_up:
             return "Up"
         return "Down"
+
+    # Methods rather than properties so that ``reason_detail`` stays free as a
+    # query-annotation alias: a property with no setter makes Django's
+    # annotation setattr raise.
+    def get_reason_detail(self) -> str | None:
+        """What actually went wrong, if the probe captured it.
+
+        Read from either a ``reason_detail`` query annotation -- which is how
+        both API paths fetch it, so the potentially 500 KB ``data["payload"]``
+        never has to be selected -- or from ``data`` when the whole column is
+        already loaded. ``__dict__`` is consulted directly so that a deferred
+        ``data`` is not silently loaded one row at a time.
+        """
+        detail = self.__dict__.get("reason_detail")
+        if detail is None:
+            data = self.__dict__.get("data")
+            if isinstance(data, dict):
+                detail = data.get(MONITOR_CHECK_DETAIL_KEY)
+        if isinstance(detail, str) and detail:
+            # Re-bounded on read: ``data`` is a JSONField, so a future writer
+            # could put anything of any length there.
+            return detail[:MONITOR_CHECK_DETAIL_MAX_LENGTH]
+        return None
+
+    def get_reason_text(self) -> str | None:
+        """Why the check failed, for humans: the reason label plus the detail."""
+        if self.is_up:
+            return None
+        detail = self.get_reason_detail()
+        if self.reason is None:
+            # Heartbeat miss: nothing was probed, so there is no reason label.
+            return detail
+        label = self.get_reason_display()
+        return f"{label}: {detail}" if detail else label
 
 
 class UptimeCheckHourlyStatistic(models.Model):
