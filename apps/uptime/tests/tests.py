@@ -17,6 +17,7 @@ from apps.projects.models import ProjectAlertStatus
 from glitchtip.test_utils.test_case import GlitchTipTestCaseMixin
 
 from ..constants import MonitorCheckReason, MonitorType
+from ..email import MonitorEmail
 from ..models import Monitor, MonitorCheck
 from ..tasks import dispatch_checks, save_monitor_checks
 from ..utils import fetch_all
@@ -161,12 +162,14 @@ class UptimeTestCase(GlitchTipTestCaseMixin, TransactionTestCase):
         )
         check = monitor.checks.first()
         self.assertFalse(check.is_up)
-        # The payload (saved only on a state change) and the detail (saved on
-        # every failing check) share the ``data`` column.
+        # The payload is saved only on a state change; a body mismatch needs no
+        # facts of its own, because the expected text is on the monitor.
         self.assertEqual(check.data["payload"], "Status: Failure")
+        self.assertNotIn("failure", check.data)
         self.assertEqual(
-            check.data["detail"],
-            'Expected text "OK" was not found in the response body',
+            check.get_reason_text(),
+            'Expected response not found: Expected text "OK" was not found in '
+            "the response body",
         )
 
     @aioresponses()
@@ -179,15 +182,17 @@ class UptimeTestCase(GlitchTipTestCaseMixin, TransactionTestCase):
         check = monitor.checks.first()
         self.assertFalse(check.is_up)
         self.assertEqual(check.reason, MonitorCheckReason.STATUS)
-        self.assertEqual(check.data["detail"], "Received HTTP 503, expected 200")
+        # Only the status the monitor did not expect is stored; the sentence is
+        # built from it and the monitor's own expected_status.
+        self.assertEqual(check.data, {"failure": {"status": 503}})
         self.assertEqual(
             check.get_reason_text(),
             "Wrong status code: Received HTTP 503, expected 200",
         )
 
     @aioresponses()
-    def test_reason_detail_saved_on_every_failing_check(self, mocked):
-        """Unlike the body payload, the detail is not limited to state changes."""
+    def test_failure_facts_saved_on_every_failing_check(self, mocked):
+        """Unlike the body payload, the facts are not limited to state changes."""
         test_url = "https://example.com"
         mocked.get(test_url, status=500, repeat=True)
         with freeze_time("2020-01-01"):
@@ -209,7 +214,7 @@ class UptimeTestCase(GlitchTipTestCaseMixin, TransactionTestCase):
         self.assertGreaterEqual(len(checks), 2)
         for check in checks:
             self.assertFalse(check.is_up)
-            self.assertEqual(check.data["detail"], "Received HTTP 500, expected 200")
+            self.assertEqual(check.data["failure"], {"status": 500})
 
     @aioresponses()
     def test_monitor_notifications(self, mocked):
@@ -283,15 +288,44 @@ class UptimeTestCase(GlitchTipTestCaseMixin, TransactionTestCase):
         # A recovery has no failure to explain.
         self.assertNotIn("Reason:", mail.outbox[1].body)
 
+    def test_heartbeat_miss_email_reports_the_interval(self):
+        """The one failure that records neither a reason nor any facts.
+
+        Nothing was probed, so the whole sentence comes from the monitor.
+        """
+        self.create_user_and_project()
+        monitor = baker.make(
+            Monitor,
+            monitor_type=MonitorType.HEARTBEAT,
+            project=self.project,
+            interval=300,
+        )
+        check = baker.make(
+            MonitorCheck,
+            monitor=monitor,
+            organization=monitor.organization,
+            is_up=False,
+            reason=None,
+            data=None,
+        )
+        MonitorEmail(
+            pk=(check.id, check.organization_id), went_down=True, last_change=None
+        ).send_email("recipient@example.com")
+        self.assertIn(
+            "Reason: No heartbeat received in the last 300 seconds",
+            mail.outbox[0].body,
+        )
+
     def _down_check(self):
         return baker.make(
             "uptime.MonitorCheck",
             monitor__monitor_type=MonitorType.GET,
             monitor__url="https://example.com",
             monitor__project=self.project,
+            monitor__expected_status=200,
             is_up=False,
             reason=MonitorCheckReason.STATUS,
-            data={"detail": "Received HTTP 500, expected 200"},
+            data={"failure": {"status": 500}},
         )
 
     @mock.patch("aiohttp.ClientSession")

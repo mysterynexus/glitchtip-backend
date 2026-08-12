@@ -18,9 +18,17 @@ class MonitorEmail(DetailEmail):
     last_change = None
 
     def get_object(self, queryset=None):
+        # The monitor supplies what was expected, which get_reason_text needs.
+        # ``data`` is deferred in favour of the projected failure facts: it can
+        # also hold a 500 KB response body that nothing here reads.
+        queryset = (
+            self.model.objects.select_related("monitor__project__organization")
+            .defer("data")
+            .with_failure()
+        )
         pk = self.kwargs.get("pk")
         if isinstance(pk, (list, tuple)):
-            return self.model.objects.get(id=pk[0], organization_id=pk[1])
+            return queryset.get(id=pk[0], organization_id=pk[1])
         return super().get_object(queryset)
 
     def get_context_data(self, **kwargs):

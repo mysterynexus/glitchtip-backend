@@ -9,11 +9,7 @@ from unittest import mock
 from asgiref.sync import async_to_sync
 from django.test import SimpleTestCase
 
-from apps.uptime.constants import (
-    BLOCKED_TARGET_DETAIL,
-    MonitorCheckReason,
-    MonitorType,
-)
+from apps.uptime.constants import MonitorCheckReason, MonitorType
 from apps.uptime.utils import fetch
 from glitchtip.test_utils.dns import resolves_to
 
@@ -55,7 +51,6 @@ def _monitor(url):
         "is_up": False,
         "latest_is_up": False,
         "reason": None,
-        "reason_detail": None,
         "response_time": None,
         "data": None,
     }
@@ -74,11 +69,10 @@ class UptimeRedirectSSRFTests(SimpleTestCase):
         self.assertEqual(result["reason"], MonitorCheckReason.NETWORK)
         # Only the public entry was dialed; the metadata IP never was.
         self.assertEqual(session.requested, ["http://public.example/"])
-        # The detail is surfaced in emails and POSTed to third-party webhooks,
-        # so it must be the fixed text -- BlockedRedirectError's own message
-        # names the internal address that was refused.
-        self.assertEqual(result["reason_detail"], str(BLOCKED_TARGET_DETAIL))
-        self.assertNotIn("169.254.169.254", result["reason_detail"])
+        # A flag, not the exception's message: the text built from it is
+        # surfaced in emails and POSTed to third-party webhooks, and
+        # BlockedRedirectError names the internal address that was refused.
+        self.assertEqual(result["failure"], {"blocked": True})
 
     def test_normal_redirect_to_public_is_followed(self):
         session = FakeSession(
@@ -107,5 +101,4 @@ class PortMonitorSSRFTests(SimpleTestCase):
             result = async_to_sync(fetch)(object(), monitor)
         self.assertFalse(result["is_up"])
         self.assertEqual(result["reason"], MonitorCheckReason.NETWORK)
-        self.assertEqual(result["reason_detail"], str(BLOCKED_TARGET_DETAIL))
-        self.assertNotIn("169.254.169.254", result["reason_detail"])
+        self.assertEqual(result["failure"], {"blocked": True})

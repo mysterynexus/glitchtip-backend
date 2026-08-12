@@ -19,7 +19,7 @@ from apps.shared.raw_sql import execute_unnest
 from glitchtip.partition_manager import UUID7Helper
 from glitchtip.ssrf_protection import safe_session
 
-from .constants import MONITOR_CHECK_DETAIL_KEY
+from .constants import FAILURE_KEY
 from .email import MonitorEmail
 from .models import Monitor, MonitorCheck, MonitorType
 from .utils import fetch
@@ -130,19 +130,20 @@ def _next_state(result):
 
 
 def _check_data(result: dict) -> dict | None:
-    """Merge the captured failure detail into the check's ``data`` blob.
+    """Merge the probe's failure facts into the check's ``data`` blob.
 
     ``data["payload"]`` is written only on a state change and only for a body
-    mismatch (see ``process_response``); ``data["detail"]`` is written on every
-    failing check, because the checks list API shows a reason per row.
+    mismatch (see ``process_response``); ``data["failure"]`` is written on
+    every failing check that observed something worth recording, because the
+    checks list API describes a reason per row.
     """
     data = result.get("data")
-    detail = result.get("reason_detail")
-    if not detail:
+    facts = result.get(FAILURE_KEY)
+    if not facts:
         return data
     if data:
-        return {**data, MONITOR_CHECK_DETAIL_KEY: detail}
-    return {MONITOR_CHECK_DETAIL_KEY: detail}
+        return {**data, FAILURE_KEY: facts}
+    return {FAILURE_KEY: facts}
 
 
 async def save_monitor_checks(results, now):

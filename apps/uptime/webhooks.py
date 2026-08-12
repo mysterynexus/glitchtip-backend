@@ -21,7 +21,11 @@ from .models import MonitorCheck
 
 
 async def _resolve_monitor_check(monitor_check_id):
-    qs = MonitorCheck.objects.select_related("monitor__project__organization")
+    qs = (
+        MonitorCheck.objects.select_related("monitor__project__organization")
+        .defer("data")
+        .with_failure()
+    )
     if isinstance(monitor_check_id, (list, tuple)):
         mid = (
             UUID(monitor_check_id[0])

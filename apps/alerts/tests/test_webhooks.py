@@ -84,6 +84,7 @@ class WebhookTestCase(GlitchTipTestCase):
             url="https://example.com",
             monitor_type=MonitorType.GET,
             project=self.project,
+            expected_status=200,
         )
         # Pinned rather than left to baker: the down message now reports the
         # check's reason, so a randomised is_up would change what is sent.
@@ -92,7 +93,7 @@ class WebhookTestCase(GlitchTipTestCase):
             monitor=self.monitor,
             is_up=False,
             reason=MonitorCheckReason.STATUS,
-            data={"detail": "Received HTTP 503, expected 200"},
+            data={"failure": {"status": 503}},
             response_time=None,
         )
 

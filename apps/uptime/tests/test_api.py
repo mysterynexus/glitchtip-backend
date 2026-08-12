@@ -317,16 +317,19 @@ class UptimeAPITestCase(GlitchTestCase):
 
     @mock.patch("apps.uptime.tasks.perform_checks")
     async def test_reason_detail_is_exposed_but_payload_is_not(self, _):
-        """Both read paths project data->>'detail' rather than the column.
+        """Both read paths project data->'failure' rather than the column.
 
         ``data`` can also hold up to 500 KB of untrusted response body, which no
         schema exposes -- neither the LATERAL join used by the monitor
-        endpoints nor the annotation used by the checks list may leak it.
+        endpoints nor the annotation used by the checks list may leak it. The
+        detail itself is built per request from the stored status and the
+        monitor's expected_status, so both paths must load the monitor too.
         """
         monitor = await baker.amake(
             "uptime.Monitor",
             organization=self.organization,
             url="http://example.com",
+            expected_status=200,
         )
         await baker.amake(
             "uptime.MonitorCheck",
@@ -334,7 +337,7 @@ class UptimeAPITestCase(GlitchTestCase):
             organization=monitor.organization,
             is_up=False,
             reason=2,
-            data={"detail": "Received HTTP 503, expected 200", "payload": "y" * 1000},
+            data={"failure": {"status": 503}, "payload": "y" * 1000},
             id=UUID7Helper.from_datetime(parse_datetime("2021-09-19T15:39:31Z")),
         )
 

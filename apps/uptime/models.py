@@ -5,6 +5,7 @@ from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator, URLValidator
 from django.db import models
 from django.db.models import F
+from django.db.models.fields.json import KeyTransform
 from django.urls import reverse
 from django_extensions.db.fields import AutoSlugField
 
@@ -12,12 +13,12 @@ from glitchtip.base_models import CreatedModel
 from glitchtip.partition_manager import UUID7Helper
 
 from .constants import (
+    FAILURE_KEY,
     HTTP_MONITOR_TYPES,
-    MONITOR_CHECK_DETAIL_KEY,
-    MONITOR_CHECK_DETAIL_MAX_LENGTH,
     MonitorCheckReason,
     MonitorType,
 )
+from .reasons import FailureFacts, describe_failure
 
 
 class MonitorManager(models.Manager):
@@ -142,6 +143,19 @@ def _generate_uuid7():
     return UUID7Helper.from_datetime()
 
 
+class MonitorCheckQuerySet(models.QuerySet):
+    def with_failure(self):
+        """Project the failure facts out of ``data`` without selecting it.
+
+        ``data`` also holds ``payload``, up to 500 KB of response body (see
+        PAYLOAD_SAVE_LIMIT) that no schema exposes, so selecting the column
+        de-TOASTs and ships that for every row. Callers should keep it out of
+        the query -- ``defer("data")``, or an ``only()`` that omits it -- and
+        ``get_failure_facts`` will read this annotation instead.
+        """
+        return self.annotate(failure=KeyTransform(FAILURE_KEY, "data"))
+
+
 class MonitorCheck(models.Model):
     """A single probe of a monitor.
 
@@ -189,6 +203,8 @@ class MonitorCheck(models.Model):
     )
     data = models.JSONField(null=True, blank=True)
 
+    objects = MonitorCheckQuerySet.as_manager()
+
     @property
     def start_check(self):
         """When the check started, read back out of the UUIDv7 ``id``.
@@ -229,28 +245,41 @@ class MonitorCheck(models.Model):
             return "Up"
         return "Down"
 
-    # Methods rather than properties so that ``reason_detail`` stays free as a
-    # query-annotation alias: a property with no setter makes Django's
-    # annotation setattr raise.
-    def get_reason_detail(self) -> str | None:
-        """What actually went wrong, if the probe captured it.
+    # Methods rather than properties so that ``failure`` stays free as a query
+    # annotation alias: a property with no setter makes Django's annotation
+    # setattr raise.
+    def get_failure_facts(self) -> FailureFacts:
+        """What the probe observed, if this check failed.
 
-        Read from either a ``reason_detail`` query annotation -- which is how
-        both API paths fetch it, so the potentially 500 KB ``data["payload"]``
+        Read from either a ``failure`` query annotation -- which is how every
+        read path fetches it, so the potentially 500 KB ``data["payload"]``
         never has to be selected -- or from ``data`` when the whole column is
         already loaded. ``__dict__`` is consulted directly so that a deferred
         ``data`` is not silently loaded one row at a time.
         """
-        detail = self.__dict__.get("reason_detail")
-        if detail is None:
-            data = self.__dict__.get("data")
-            if isinstance(data, dict):
-                detail = data.get(MONITOR_CHECK_DETAIL_KEY)
-        if isinstance(detail, str) and detail:
-            # Re-bounded on read: ``data`` is a JSONField, so a future writer
-            # could put anything of any length there.
-            return detail[:MONITOR_CHECK_DETAIL_MAX_LENGTH]
-        return None
+        loaded = self.__dict__
+        if "failure" in loaded:
+            return FailureFacts.from_data(loaded["failure"])
+        data = loaded.get("data")
+        if isinstance(data, dict):
+            return FailureFacts.from_data(data.get(FAILURE_KEY))
+        return FailureFacts()
+
+    def get_reason_detail(self) -> str | None:
+        """What actually went wrong, in words.
+
+        Built here rather than stored: see ``uptime.reasons``. The monitor
+        supplies what was expected, and is read only if it is already loaded --
+        these objects are serialized inside async views, where a lazily fetched
+        relation raises SynchronousOnlyOperation.
+        """
+        if self.is_up:
+            return None
+        return describe_failure(
+            self.reason,
+            self.get_failure_facts(),
+            self._state.fields_cache.get("monitor"),
+        )
 
     def get_reason_text(self) -> str | None:
         """Why the check failed, for humans: the reason label plus the detail."""

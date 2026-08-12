@@ -25,9 +25,11 @@ class MonitorCheckSchema(CamelSchema, ModelSchema):
     # is unchanged for API clients.
     start_check: datetime
     # What actually went wrong ("Received HTTP 503, expected 200"), where
-    # ``reason`` says only which kind of failure it was. Not a column either --
-    # see MonitorCheck.get_reason_detail. Only the detail is exposed, never the
-    # ``data`` column it lives in: that can also hold a 500 KB response body.
+    # ``reason`` says only which kind of failure it was. Not stored as text --
+    # it is built per request from the facts the check recorded and what the
+    # monitor expected, see MonitorCheck.get_reason_detail. Only that sentence
+    # is exposed, never the ``data`` column the facts live in: that can also
+    # hold a 500 KB response body.
     reason_detail: str | None = None
 
     class Meta:
