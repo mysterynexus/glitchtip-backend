@@ -109,13 +109,18 @@ async def fetch_checks_lateral(
     if not monitor_ids:
         return {}
 
+    # ``data -> 'failure'`` rather than ``data`` itself: the column can also
+    # hold up to 500 KB of response body (see PAYLOAD_SAVE_LIMIT), which no
+    # schema exposes, and selecting it de-TOASTs and ships that for every one
+    # of the ``limit`` checks of every monitor.
     sql = """
         SELECT c.id, c.organization_id, c.monitor_id,
-               c.response_time, c.reason, c.is_up, c.is_change, c.data
+               c.response_time, c.reason, c.is_up, c.is_change, c.failure
         FROM unnest(%(monitor_ids)s::int[]) AS m(id)
         CROSS JOIN LATERAL (
             SELECT id, organization_id, monitor_id,
-                   response_time, reason, is_up, is_change, data
+                   response_time, reason, is_up, is_change,
+                   data -> 'failure' AS failure
             FROM uptime_monitorcheck
             WHERE monitor_id = m.id AND organization_id = %(organization_id)s
             ORDER BY id DESC
@@ -149,8 +154,10 @@ async def fetch_checks_lateral(
             reason=row["reason"],
             is_up=row["is_up"],
             is_change=row["is_change"],
-            data=row["data"],
         )
+        # Assigned after construction: Model.__init__ rejects kwargs that are
+        # not fields. MonitorCheck.get_failure_facts reads this alias.
+        check.failure = row["failure"]
         checks_by_monitor[row["monitor_id"]].append(check)
 
     return dict(checks_by_monitor)
@@ -181,9 +188,14 @@ async def attach_checks_to_monitors(
         )
     for monitor in monitors:
         # Use Django's prefetch cache so serializers see the checks
-        monitor._prefetched_objects_cache = {
-            "checks": checks_by_monitor.get(monitor.id, [])
-        }
+        checks = checks_by_monitor.get(monitor.id, [])
+        monitor._prefetched_objects_cache = {"checks": checks}
+        for check in checks:
+            # Populates the FK cache from an object already in hand, so
+            # get_reason_detail can read what the monitor expected without a
+            # query -- these are serialized in async views, where a lazily
+            # fetched relation would raise.
+            check.monitor = monitor
     return monitors
 
 
@@ -360,7 +372,23 @@ async def list_monitor_checks(
             monitor__organization__slug=organization_slug,
             monitor__organization__users=request.auth.user_id,
         )
-        .only("is_up", "reason", "response_time")
+        # The monitor supplies what was expected, which is half of every
+        # sentence get_reason_detail builds; named field by field so a 2000
+        # char url is not shipped per check row.
+        .select_related("monitor")
+        .only(
+            "is_up",
+            "reason",
+            "response_time",
+            "monitor__monitor_type",
+            "monitor__interval",
+            "monitor__timeout",
+            "monitor__expected_status",
+            "monitor__expected_body",
+        )
+        # ``data -> 'failure'`` rather than adding ``data`` to .only(): the
+        # column can also hold a 500 KB response body that no schema exposes.
+        .with_failure()
         # By the partition key, so paging deeper walks partitions newest-first
         # instead of re-opening every one per page. See MonitorCheck.Meta.
         .order_by("-id")

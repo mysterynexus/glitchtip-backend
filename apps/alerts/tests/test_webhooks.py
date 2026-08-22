@@ -7,7 +7,7 @@ from asgiref.sync import async_to_sync
 from model_bakery import baker
 
 from apps.issue_events.constants import LogLevel
-from apps.uptime.constants import MonitorType
+from apps.uptime.constants import MonitorCheckReason, MonitorType
 from apps.uptime.models import Monitor, MonitorCheck
 from apps.uptime.webhooks import send_uptime_as_webhook
 from glitchtip.test_utils.issue import make_issue
@@ -84,12 +84,25 @@ class WebhookTestCase(GlitchTipTestCase):
             url="https://example.com",
             monitor_type=MonitorType.GET,
             project=self.project,
+            expected_status=200,
         )
-        self.monitor_check = baker.make(MonitorCheck, monitor=self.monitor)
+        # Pinned rather than left to baker: the down message now reports the
+        # check's reason, so a randomised is_up would change what is sent.
+        self.monitor_check = baker.make(
+            MonitorCheck,
+            monitor=self.monitor,
+            is_up=False,
+            reason=MonitorCheckReason.STATUS,
+            data={"failure": {"status": 503}},
+            response_time=None,
+        )
 
         self.expected_subject = "GlitchTip Uptime Alert"
         self.expected_message_down = "The monitored site has gone down."
         self.expected_message_up = "The monitored site is back up."
+        self.expected_reason = (
+            "Reason: Wrong status code: Received HTTP 503, expected 200"
+        )
 
     def generate_issue_with_tags(self):
         key_environment = baker.make("issue_events.TagKey", key="environment")
@@ -370,7 +383,9 @@ class WebhookTestCase(GlitchTipTestCase):
         json_data = json.dumps(mock_post.call_args.kwargs["json"])
         self.assertIn(f'"text": "{self.expected_subject}"', json_data)
         self.assertIn(f'"title": "{self.monitor.name}"', json_data)
-        self.assertIn(f'"text": "{self.expected_message_down}"', json_data)
+        # No closing quote: the down message continues onto further lines.
+        self.assertIn(f'"text": "{self.expected_message_down}', json_data)
+        self.assertIn(self.expected_reason, json_data)
 
         mock_post.reset_mock()
 
@@ -453,7 +468,11 @@ class WebhookTestCase(GlitchTipTestCase):
             f'"title": "{self.expected_subject}", "subtitle": "{self.monitor.name}"',
             json_data,
         )
-        self.assertIn(f'"text": "{self.expected_message_down}"', json_data)
+        # Google Chat is the one transport that gets <br> instead of "\n".
+        self.assertIn(
+            f'"text": "{self.expected_message_down}<br>{self.expected_reason}',
+            json_data,
+        )
 
         mock_post.reset_mock()
 
@@ -492,9 +511,10 @@ class WebhookTestCase(GlitchTipTestCase):
         json_data = json.dumps(mock_post.call_args.kwargs["json"])
         self.assertIn(f'"content": "{self.expected_subject}"', json_data)
         self.assertIn(
-            f'"title": "{self.monitor.name}", "description": "{self.expected_message_down}"',
+            f'"title": "{self.monitor.name}", "description": "{self.expected_message_down}',
             json_data,
         )
+        self.assertIn(self.expected_reason, json_data)
 
         mock_post.reset_mock()
 

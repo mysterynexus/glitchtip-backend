@@ -69,6 +69,10 @@ class UptimeRedirectSSRFTests(SimpleTestCase):
         self.assertEqual(result["reason"], MonitorCheckReason.NETWORK)
         # Only the public entry was dialed; the metadata IP never was.
         self.assertEqual(session.requested, ["http://public.example/"])
+        # A flag, not the exception's message: the text built from it is
+        # surfaced in emails and POSTed to third-party webhooks, and
+        # BlockedRedirectError names the internal address that was refused.
+        self.assertEqual(result["failure"], {"blocked": True})
 
     def test_normal_redirect_to_public_is_followed(self):
         session = FakeSession(
@@ -97,3 +101,4 @@ class PortMonitorSSRFTests(SimpleTestCase):
             result = async_to_sync(fetch)(object(), monitor)
         self.assertFalse(result["is_up"])
         self.assertEqual(result["reason"], MonitorCheckReason.NETWORK)
+        self.assertEqual(result["failure"], {"blocked": True})

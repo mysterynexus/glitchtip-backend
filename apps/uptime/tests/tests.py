@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 from unittest import mock
 
@@ -15,7 +16,8 @@ from apps.organizations_ext.constants import OrganizationUserRole
 from apps.projects.models import ProjectAlertStatus
 from glitchtip.test_utils.test_case import GlitchTipTestCaseMixin
 
-from ..constants import MonitorType
+from ..constants import MonitorCheckReason, MonitorType
+from ..email import MonitorEmail
 from ..models import Monitor, MonitorCheck
 from ..tasks import dispatch_checks, save_monitor_checks
 from ..utils import fetch_all
@@ -160,7 +162,59 @@ class UptimeTestCase(GlitchTipTestCaseMixin, TransactionTestCase):
         )
         check = monitor.checks.first()
         self.assertFalse(check.is_up)
+        # The payload is saved only on a state change; a body mismatch needs no
+        # facts of its own, because the expected text is on the monitor.
         self.assertEqual(check.data["payload"], "Status: Failure")
+        self.assertNotIn("failure", check.data)
+        self.assertEqual(
+            check.get_reason_text(),
+            'Expected response not found: Expected text "OK" was not found in '
+            "the response body",
+        )
+
+    @aioresponses()
+    def test_status_reason_detail(self, mocked):
+        test_url = "https://example.com"
+        mocked.get(test_url, status=503)
+        monitor = baker.make(
+            Monitor, name=test_url, url=test_url, monitor_type=MonitorType.GET
+        )
+        check = monitor.checks.first()
+        self.assertFalse(check.is_up)
+        self.assertEqual(check.reason, MonitorCheckReason.STATUS)
+        # Only the status the monitor did not expect is stored; the sentence is
+        # built from it and the monitor's own expected_status.
+        self.assertEqual(check.data, {"failure": {"status": 503}})
+        self.assertEqual(
+            check.get_reason_text(),
+            "Wrong status code: Received HTTP 503, expected 200",
+        )
+
+    @aioresponses()
+    def test_failure_facts_saved_on_every_failing_check(self, mocked):
+        """Unlike the body payload, the facts are not limited to state changes."""
+        test_url = "https://example.com"
+        mocked.get(test_url, status=500, repeat=True)
+        with freeze_time("2020-01-01"):
+            monitor = baker.make(
+                Monitor,
+                name=test_url,
+                url=test_url,
+                monitor_type=MonitorType.GET,
+                interval=60,
+            )
+
+            async def run_loop():
+                for _ in range(60):
+                    await dispatch_checks.func()
+
+            async_to_sync(run_loop)()
+
+        checks = list(monitor.checks.all())
+        self.assertGreaterEqual(len(checks), 2)
+        for check in checks:
+            self.assertFalse(check.is_up)
+            self.assertEqual(check.data["failure"], {"status": 500})
 
     @aioresponses()
     def test_monitor_notifications(self, mocked):
@@ -203,6 +257,10 @@ class UptimeTestCase(GlitchTipTestCaseMixin, TransactionTestCase):
 
         self.assertEqual(len(mail.outbox), 1)
         self.assertIn("is down", mail.outbox[0].body)
+        self.assertIn(
+            "Reason: Wrong status code: Received HTTP 500, expected 200",
+            mail.outbox[0].body,
+        )
         self.assertEqual(mail.outbox[0].extra_headers["X-Mailer"], "GlitchTip")
         self.assertEqual(
             mail.outbox[0].extra_headers["X-GlitchTip-Project"], self.project.name
@@ -227,6 +285,48 @@ class UptimeTestCase(GlitchTipTestCaseMixin, TransactionTestCase):
             async_to_sync(run_loop)()
         self.assertEqual(len(mail.outbox), 2)
         self.assertIn("is back up", mail.outbox[1].body)
+        # A recovery has no failure to explain.
+        self.assertNotIn("Reason:", mail.outbox[1].body)
+
+    def test_heartbeat_miss_email_reports_the_interval(self):
+        """The one failure that records neither a reason nor any facts.
+
+        Nothing was probed, so the whole sentence comes from the monitor.
+        """
+        self.create_user_and_project()
+        monitor = baker.make(
+            Monitor,
+            monitor_type=MonitorType.HEARTBEAT,
+            project=self.project,
+            interval=300,
+        )
+        check = baker.make(
+            MonitorCheck,
+            monitor=monitor,
+            organization=monitor.organization,
+            is_up=False,
+            reason=None,
+            data=None,
+        )
+        MonitorEmail(
+            pk=(check.id, check.organization_id), went_down=True, last_change=None
+        ).send_email("recipient@example.com")
+        self.assertIn(
+            "Reason: No heartbeat received in the last 300 seconds",
+            mail.outbox[0].body,
+        )
+
+    def _down_check(self):
+        return baker.make(
+            "uptime.MonitorCheck",
+            monitor__monitor_type=MonitorType.GET,
+            monitor__url="https://example.com",
+            monitor__project=self.project,
+            monitor__expected_status=200,
+            is_up=False,
+            reason=MonitorCheckReason.STATUS,
+            data={"failure": {"status": 500}},
+        )
 
     @mock.patch("aiohttp.ClientSession")
     def test_discord_webhook(self, MockSession):
@@ -236,19 +336,44 @@ class UptimeTestCase(GlitchTipTestCaseMixin, TransactionTestCase):
         MockSession.side_effect = mock_constructor
 
         self.create_user_and_project()
-        test_url = "https://example.com"
         webhook_url = "https://discord.com/api/webhooks/test/test"
-        check = baker.make(
-            "uptime.MonitorCheck",
-            monitor__monitor_type=MonitorType.GET,
-            monitor__url=test_url,
-            monitor__project=self.project,
-        )
+        check = self._down_check()
         recipient = baker.make(
             "alerts.AlertRecipient", recipient_type="discord", url=webhook_url
         )
         async_to_sync(send_uptime_as_webhook)(recipient, check.pk, True, timezone.now())
         mock_post.assert_called_once()
+        payload = json.dumps(mock_post.call_args.kwargs["json"])
+        self.assertIn("Wrong status code: Received HTTP 500, expected 200", payload)
+        self.assertIn("https://example.com", payload)
+
+    @mock.patch("aiohttp.ClientSession")
+    def test_generic_webhook_includes_reason(self, MockSession):
+        from apps.alerts.tests.test_webhooks import _mock_aiohttp_session
+
+        mock_constructor, mock_post = _mock_aiohttp_session()
+        MockSession.side_effect = mock_constructor
+
+        self.create_user_and_project()
+        check = self._down_check()
+        recipient = baker.make(
+            "alerts.AlertRecipient",
+            recipient_type="webhook",
+            url="https://webhook.example.com",
+        )
+        async_to_sync(send_uptime_as_webhook)(recipient, check.pk, True, timezone.now())
+        payload = json.dumps(mock_post.call_args.kwargs["json"])
+        self.assertIn("The monitored site has gone down.", payload)
+        self.assertIn("Wrong status code: Received HTTP 500, expected 200", payload)
+
+        # A recovery stays a single clean line.
+        mock_post.reset_mock()
+        async_to_sync(send_uptime_as_webhook)(
+            recipient, check.pk, False, timezone.now()
+        )
+        payload = json.dumps(mock_post.call_args.kwargs["json"])
+        self.assertIn("The monitored site is back up.", payload)
+        self.assertNotIn("Reason:", payload)
 
     @aioresponses()
     def test_notification_default_scope(self, mocked):

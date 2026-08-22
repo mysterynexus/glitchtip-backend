@@ -1,6 +1,8 @@
 from datetime import datetime
 from uuid import UUID
 
+from django.utils.translation import gettext
+
 from apps.alerts.constants import RecipientType
 from apps.alerts.models import AlertRecipient
 from apps.alerts.webhooks import (
@@ -20,7 +22,11 @@ from .models import MonitorCheck
 
 
 async def _resolve_monitor_check(monitor_check_id):
-    qs = MonitorCheck.objects.select_related("monitor__project__organization")
+    qs = (
+        MonitorCheck.objects.select_related("monitor__project__organization")
+        .defer("data")
+        .with_failure()
+    )
     if isinstance(monitor_check_id, (list, tuple)):
         mid = (
             UUID(monitor_check_id[0])
@@ -41,7 +47,9 @@ async def _send_uptime_googlechat(recipient, monitor, subject, message, _went_do
     card = GoogleChatCard().construct_uptime_card(
         title=subject,
         subtitle=monitor.name,
-        text=message,
+        # The only transport that does not render "\n": a decoratedText widget
+        # takes limited HTML instead.
+        text=message.replace("\n", "<br>"),
         url=monitor.get_detail_url(),
     )
     return await send_googlechat_webhook(recipient.url, [card])
@@ -144,6 +152,27 @@ UPTIME_NOTIFICATION_HANDLERS = {
 }
 
 
+def _uptime_message(monitor, monitor_check, went_down: bool) -> str:
+    """Notification body, shared by every transport.
+
+    Kept as one string rather than per-transport structures so that every
+    handler -- including any added later -- carries the failure reason without
+    a signature change.
+    """
+    if not went_down:
+        # A recovery has no failure to explain, so it stays one clean line.
+        return gettext("The monitored site is back up.")
+
+    lines = [gettext("The monitored site has gone down.")]
+    if reason_text := monitor_check.get_reason_text():
+        lines.append(gettext("Reason: %s") % reason_text)
+    if monitor.url:
+        lines.append(gettext("URL: %s") % monitor.url)
+    if monitor_check.response_time is not None:
+        lines.append(gettext("Response time: %s ms") % monitor_check.response_time)
+    return "\n".join(lines)
+
+
 async def send_uptime_as_webhook(
     recipient: AlertRecipient,
     monitor_check_id: tuple | list | int,
@@ -156,11 +185,7 @@ async def send_uptime_as_webhook(
     monitor_check = await _resolve_monitor_check(monitor_check_id)
     monitor = monitor_check.monitor
 
-    message = (
-        "The monitored site has gone down."
-        if went_down
-        else "The monitored site is back up."
-    )
+    message = _uptime_message(monitor, monitor_check, went_down)
     subject = "GlitchTip Uptime Alert"
 
     handler = UPTIME_NOTIFICATION_HANDLERS.get(
