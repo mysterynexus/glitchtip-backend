@@ -856,7 +856,8 @@ ACCOUNT_EMAIL_SUBJECT_PREFIX = env.str("ACCOUNT_EMAIL_SUBJECT_PREFIX", "")
 # authenticates with a short-lived IAM token, so any PASSWORD in DATABASE_URL
 # is ignored by the driver. See glitchtip/db_iam.py for the AWS prerequisites.
 DATABASE_IAM_AUTH = env.bool("DATABASE_IAM_AUTH", False)
-# Which DATABASES aliases authenticate with IAM. Defaults to "default" only,
+# Which DATABASES aliases authenticate with a minted credential — IAM or a
+# DATABASE_CREDENTIAL_PROVIDER one. Defaults to "default" only,
 # and deliberately not to every alias: the read_only alias may point at a
 # PgBouncer, which authenticates its own clients and cannot validate an IAM
 # token — it would simply receive a live, replayable AWS credential in the
@@ -869,10 +870,16 @@ DATABASE_IAM_AUTH_ALIASES = [
     for alias in env.str("DATABASE_IAM_AUTH_ALIASES", "default").split(",")
     if alias.strip()
 ]
-# Seconds a minted credential is reused. Only a fallback: the RDS provider
-# reports the token's own expiry, which the driver prefers, so this has no
-# effect with it. Unset means the driver's own default.
-DATABASE_IAM_TOKEN_TTL = env.int("DATABASE_IAM_TOKEN_TTL", 0)
+# Generic hook for a non-AWS credential issuer (Vault's dynamic secrets, an
+# in-house signer): a dotted path to a callable following django-vpg's
+# credential_provider contract. Mutually exclusive with DATABASE_IAM_AUTH, and
+# subject to the same TLS guards. Applies to the same aliases.
+DATABASE_CREDENTIAL_PROVIDER = env.str("DATABASE_CREDENTIAL_PROVIDER", None)
+# Seconds a minted credential is reused. Only a fallback for providers that
+# report no expiry: the RDS provider reports the token's own expiry, which the
+# driver prefers, so this has no effect with it. Unset means the driver's own
+# default.
+DATABASE_CREDENTIAL_TTL = env.int("DATABASE_CREDENTIAL_TTL", 0)
 # Accept a database server whose identity is not verified. Only meaningful
 # with IAM auth, where it means a live token may be handed to anything that
 # answers on the hostname. Exists so the insecure choice has to be made
@@ -950,7 +957,7 @@ if VALKEY_HOST:
 else:
     VALKEY_URL = env.str("VALKEY_URL", env.str("REDIS_URL", "redis://redis:6379/0"))
 
-if DATABASE_IAM_AUTH:
+if DATABASE_IAM_AUTH or DATABASE_CREDENTIAL_PROVIDER:
     _unknown = set(DATABASE_IAM_AUTH_ALIASES) - set(DATABASES)
     if _unknown:
         raise ImproperlyConfigured(
@@ -979,8 +986,11 @@ if DATABASE_IAM_AUTH:
     except (TypeError, ValueError):  # pragma: no cover - builtin without one
         _vpg_params = {}
     if "credential_provider" not in _vpg_params:
+        _db_credential_setting = (
+            "DATABASE_IAM_AUTH" if DATABASE_IAM_AUTH else "DATABASE_CREDENTIAL_PROVIDER"
+        )
         raise ImproperlyConfigured(
-            "DATABASE_IAM_AUTH requires a database driver with "
+            f"{_db_credential_setting} requires a database driver with "
             "rotating-credential support, but the loaded "
             f"{sys.modules['django_vpg._vpg_driver'].__name__} extension "
             "does not accept "
@@ -1050,12 +1060,17 @@ for _db_alias, db_config in DATABASES.items():
                 f"disable prepared statements; got {_prepare_threshold!r}"
             )
 
-    # TLS and, when enabled, RDS IAM authentication. An OPTIONS entry set
-    # explicitly in a DATABASES override still wins over the environment.
+    # TLS and, when enabled, a rotating credential (RDS IAM, or whatever
+    # DATABASE_CREDENTIAL_PROVIDER names). An OPTIONS entry set explicitly in
+    # a DATABASES override still wins over the environment.
+    _db_credential_alias = _db_alias in DATABASE_IAM_AUTH_ALIASES
     _db_iam.configure_options(
         options,
-        iam_auth=DATABASE_IAM_AUTH and _db_alias in DATABASE_IAM_AUTH_ALIASES,
-        token_ttl=DATABASE_IAM_TOKEN_TTL,
+        iam_auth=DATABASE_IAM_AUTH and _db_credential_alias,
+        credential_provider=(
+            DATABASE_CREDENTIAL_PROVIDER if _db_credential_alias else None
+        ),
+        credential_ttl=DATABASE_CREDENTIAL_TTL,
         sslmode=DATABASE_SSLMODE,
         sslrootcert=DATABASE_SSLROOTCERT,
         allow_unverified_tls=DATABASE_IAM_ALLOW_UNVERIFIED_TLS,
@@ -1130,6 +1145,52 @@ VTASKS_TASK_CONTEXT = "glitchtip.vtasks_context.sentry_task_scope"
 # Maximum number of issues send in a single alert payload
 MAX_ISSUES_PER_ALERT = env.int("MAX_ISSUES_PER_ALERT", 3)
 
+# AWS ElastiCache IAM authentication for Valkey. When enabled there is no
+# cache password: the driver calls
+# django_vcache.contrib.aws.elasticache_iam_token for the connections it opens
+# and authenticates with a short-lived IAM token. The IAM-enabled ElastiCache
+# user goes in the VALKEY_URL userinfo — valkeys://<iam-user>@host:6379/0 —
+# because the token is signed for that ACL user; any password in VALKEY_URL is
+# ignored by the driver. See glitchtip/valkey_iam.py for the AWS
+# prerequisites.
+VALKEY_IAM_AUTH = env.bool("VALKEY_IAM_AUTH", False)
+# The cache the token is signed for. The token signs the cache name and user
+# id, neither of which is the hostname, so these are only derivable from
+# endpoints whose shape reveals them (serverless, clustercfg., master.,
+# replica.). Leave unset for those; set them for a node endpoint, a CNAME, or
+# a region the provider's abbreviation table does not know.
+VALKEY_IAM_CACHE_NAME = env.str("VALKEY_IAM_CACHE_NAME", None)
+VALKEY_IAM_REGION = env.str("VALKEY_IAM_REGION", None)
+# Defaults to the VALKEY_URL username. AWS requires an IAM-mode user's id to
+# equal its user name, so this differs only in deployments that broke that
+# rule before switching authentication mode.
+VALKEY_IAM_USER_ID = env.str("VALKEY_IAM_USER_ID", None)
+# Whether the cache is an ElastiCache Serverless cache, which the token has to
+# say (ResourceType=ServerlessCache). Deliberately tri-state rather than a
+# plain bool: unset means "let the provider read it off the endpoint", which
+# is right for every endpoint shaped like an ElastiCache one, and a default of
+# False would instead assert node-based and mint a token the cache rejects.
+_valkey_iam_serverless = env.str("VALKEY_IAM_SERVERLESS", None)
+VALKEY_IAM_SERVERLESS = (
+    None
+    if _valkey_iam_serverless in (None, "")
+    else _valkey_iam_serverless.strip().lower() in ("true", "yes", "on", "1")
+)
+# Accept a cache server whose identity is not verified. Only meaningful with a
+# rotating credential, where it means a live token may be handed to anything
+# that answers on the hostname. Exists so the insecure choice has to be made
+# deliberately rather than by following an error message.
+VALKEY_IAM_ALLOW_UNVERIFIED_TLS = env.bool("VALKEY_IAM_ALLOW_UNVERIFIED_TLS", False)
+# Generic hook for a non-AWS credential issuer (Vault, Azure Entra ID, an
+# in-house signer): a dotted path to a callable following django-vcache's
+# credential_provider contract. Mutually exclusive with VALKEY_IAM_AUTH.
+VALKEY_CREDENTIAL_PROVIDER = env.str("VALKEY_CREDENTIAL_PROVIDER", None)
+# Seconds a minted credential is reused. Only a fallback for providers that
+# report no expiry: the ElastiCache provider states the token's own deadline,
+# which the driver prefers, so this has no effect with it. Unset means the
+# driver's own default.
+VALKEY_CREDENTIAL_TTL = env.int("VALKEY_CREDENTIAL_TTL", 0)
+
 # VALKEY_URL drives both cache and task broker. Empty string disables valkey.
 # TLS: use rediss:// or valkeys:// URL scheme. For custom CA or mTLS, set
 # VALKEY_SSL_CA_CERTS, VALKEY_SSL_CERTFILE, VALKEY_SSL_KEYFILE env vars.
@@ -1145,6 +1206,68 @@ if VALKEY_URL:
         _valkey_options["ssl_keyfile"] = _ssl_key
     if _ssl_reqs := env.str("VALKEY_SSL_CERT_REQS", None):
         _valkey_options["ssl_cert_reqs"] = _ssl_reqs
+
+    # Rotating credentials (AWS ElastiCache IAM auth, or any other issuer via
+    # VALKEY_CREDENTIAL_PROVIDER). Nothing separate is needed for TASKS:
+    # django-vtasks' broker talks to Valkey through the default cache alias's
+    # cache.get_raw_client(), so it uses this same authenticated driver.
+    #
+    # Imported here rather than at the top of the file: ``glitchtip/__init__``
+    # pulls in ``glitchtip.lookups``, which reaches into Django's ORM, and
+    # that must not happen while settings are still being assembled.
+    from glitchtip import valkey_iam as _valkey_iam
+
+    _valkey_provider_options = {
+        key: value
+        for key, value in (
+            ("cache_name", VALKEY_IAM_CACHE_NAME),
+            ("region", VALKEY_IAM_REGION),
+            ("user_id", VALKEY_IAM_USER_ID),
+            ("serverless", VALKEY_IAM_SERVERLESS),
+        )
+        if value is not None
+    }
+    _valkey_iam.configure_options(
+        _valkey_options,
+        location=VALKEY_URL,
+        iam_auth=VALKEY_IAM_AUTH,
+        credential_provider=VALKEY_CREDENTIAL_PROVIDER,
+        provider_options=_valkey_provider_options,
+        credential_ttl=VALKEY_CREDENTIAL_TTL,
+        allow_unverified_tls=VALKEY_IAM_ALLOW_UNVERIFIED_TLS,
+    )
+    if VALKEY_IAM_AUTH or VALKEY_CREDENTIAL_PROVIDER:
+        # Fail closed if the installed driver cannot honour
+        # credential_provider. django-vcache only passes the kwarg to drivers
+        # that accept it, so an older extension would silently connect with
+        # whatever password VALKEY_URL carries (usually none) instead — a
+        # security feature turned on that quietly does nothing.
+        #
+        # Inspect the configured DRIVER_CLASS, not django_vcache: gt_rust
+        # re-exports vcache-pyo3's compiled driver as its own, and that
+        # substituted extension is the one whose capability actually decides
+        # this.
+        import inspect
+
+        from django.utils.module_loading import import_string
+
+        _valkey_driver_cls = import_string(_valkey_options["DRIVER_CLASS"])
+        try:
+            _valkey_params = inspect.signature(_valkey_driver_cls.connect).parameters
+        except (TypeError, ValueError):  # pragma: no cover - builtin without one
+            _valkey_params = {}
+        if "credential_provider" not in _valkey_params:
+            _valkey_setting = (
+                "VALKEY_IAM_AUTH" if VALKEY_IAM_AUTH else "VALKEY_CREDENTIAL_PROVIDER"
+            )
+            raise ImproperlyConfigured(
+                f"{_valkey_setting} requires a Valkey driver with "
+                "rotating-credential support, but the loaded "
+                f"{_valkey_options['DRIVER_CLASS']} does not accept "
+                "credential_provider and would fall back to the password in "
+                "VALKEY_URL. Upgrade glitchtip-rust, which supplies it."
+            )
+
     CACHES = {
         "default": {
             "BACKEND": "django_vcache.backend.ValkeyCache",
