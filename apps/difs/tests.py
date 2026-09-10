@@ -21,6 +21,12 @@ from model_bakery import baker
 from pydantic import ValidationError
 
 from apps.difs.api import _PROGUARD_SNIFF_BYTES, extract_proguard_metadata
+from apps.difs.flutter import (
+    dart_image_base,
+    has_dart_frames,
+    is_dart_footer_frame,
+    parse_dart_image_info,
+)
 from apps.difs.models import DebugInformationFile
 from apps.difs.stacktrace_processor import (
     MAX_BASE_PROBES,
@@ -36,6 +42,7 @@ from apps.difs.stacktrace_processor import (
 )
 from apps.difs.tasks import (
     ChecksumMismatched,
+    _code_id_debug_ids,
     difs_create_difs,
     difs_create_file_from_chunks,
     resolve_event_stacktraces,
@@ -2277,3 +2284,414 @@ class BreakpadSymbolicationTestCase(GlitchTipTransactionTestCase):
             with self.subTest(debug_id=debug_id):
                 image = {"type": "pe", "debug_id": debug_id, "debug_file": "crash.pdb"}
                 self.assertEqual(self.resolve(image, "Windows"), self.RESOLVED)
+
+
+DART_FOOTER_FRAMES = [
+    {"function": "***", "platform": "dart"},
+    {"function": "pid: 4242, tid: 4243, name 1.ui", "platform": "dart"},
+    {
+        "function": "isolate_instructions: 789379ca80, vm_instructions: 7893786000",
+        "platform": "dart",
+    },
+    {
+        "function": "isolate_dso_base: 7893236000, vm_dso_base: 7893236000",
+        "platform": "dart",
+    },
+    {"function": "build_id: 'b7188509241222671ab8064247a69c76'", "platform": "dart"},
+    {
+        "abs_path": "os:",
+        "function": "android arch: arm64 comp: yes sim: no",
+        "platform": "dart",
+    },
+]
+
+# A small Dart snapshot: image at 0x400000, isolate code from 0x402000,
+# VM code from 0x401000.
+DART_IMAGE_INFO = {
+    "isolate_dso_base": 0x400000,
+    "vm_dso_base": 0x400000,
+    "isolate_instructions": 0x402000,
+    "vm_instructions": 0x401000,
+}
+
+
+class ParseDartImageInfoTestCase(GlitchTestCase):
+    def test_parses_footer_pseudo_frames(self):
+        event = {
+            "exception": {
+                "values": [
+                    {
+                        "stacktrace": {
+                            "frames": [
+                                {
+                                    "instruction_addr": "0x78937d0c10",
+                                    "function": "bK",
+                                    "platform": "dart",
+                                },
+                                *DART_FOOTER_FRAMES,
+                            ]
+                        }
+                    }
+                ]
+            }
+        }
+        info = parse_dart_image_info(event)
+        self.assertEqual(info["isolate_dso_base"], 0x7893236000)
+        self.assertEqual(info["vm_dso_base"], 0x7893236000)
+        self.assertEqual(info["isolate_instructions"], 0x789379CA80)
+        self.assertEqual(info["vm_instructions"], 0x7893786000)
+        self.assertEqual(info["build_id"], "b7188509241222671ab8064247a69c76")
+        self.assertEqual(info["arch"], "arm64")
+
+    def test_parses_dart_image_context(self):
+        event = {
+            "contexts": {
+                "dart_image": {
+                    "isolate_dso_base": "0x400000",
+                    "vm_dso_base": "0x400000",
+                    "isolate_instructions": "0x402000",
+                    "vm_instructions": "0x401000",
+                    "build_id": "B7188509241222671AB8064247A69C76",
+                    "arch": "arm64",
+                }
+            },
+            "exception": {"values": [{"stacktrace": {"frames": []}}]},
+        }
+        info = parse_dart_image_info(event)
+        self.assertEqual(
+            info,
+            dict(
+                DART_IMAGE_INFO,
+                build_id="b7188509241222671ab8064247a69c76",
+                arch="arm64",
+            ),
+        )
+
+    def test_context_takes_priority_over_footer(self):
+        event = {
+            "contexts": {"dart_image": dict(DART_IMAGE_INFO, build_id="abcd" * 8)},
+            "exception": {
+                "values": [{"stacktrace": {"frames": [*DART_FOOTER_FRAMES]}}]
+            },
+        }
+        info = parse_dart_image_info(event)
+        # Image values come from the context (0x400000, not 0x7893236000);
+        # arch has no context counterpart, so the footer still supplies it.
+        self.assertEqual(info["isolate_dso_base"], 0x400000)
+        self.assertEqual(info["build_id"], "abcd" * 8)
+        self.assertEqual(info["arch"], "arm64")
+
+    def test_partial_footer_yields_partial_info(self):
+        event = {
+            "exception": {
+                "values": [
+                    {
+                        "stacktrace": {
+                            "frames": [
+                                {
+                                    "function": (
+                                        "isolate_dso_base: 400000, vm_dso_base: 400000"
+                                    )
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        }
+        info = parse_dart_image_info(event)
+        self.assertEqual(info, {"isolate_dso_base": 0x400000, "vm_dso_base": 0x400000})
+
+    def test_no_dart_data_returns_none(self):
+        event = {
+            "exception": {"values": [{"stacktrace": {"frames": [{"function": "foo"}]}}]}
+        }
+        self.assertIsNone(parse_dart_image_info(event))
+        self.assertIsNone(parse_dart_image_info({}))
+
+
+class DartImageBaseTestCase(GlitchTestCase):
+    def test_isolate_address_uses_isolate_base(self):
+        self.assertEqual(dart_image_base(DART_IMAGE_INFO, 0x402ABC), 0x400000)
+
+    def test_vm_address_uses_vm_base(self):
+        self.assertEqual(dart_image_base(DART_IMAGE_INFO, 0x401800), 0x400000)
+
+    def test_address_below_the_snapshot_is_not_resolved(self):
+        self.assertIsNone(dart_image_base(DART_IMAGE_INFO, 0x1000))
+
+    def test_no_bounds_with_equal_bases_still_applies(self):
+        info = {"isolate_dso_base": 0x400000, "vm_dso_base": 0x400000}
+        self.assertEqual(dart_image_base(info, 0x401000), 0x400000)
+        self.assertIsNone(dart_image_base(info, 0x1000))
+
+    def test_no_bounds_with_unequal_bases_refuses_to_guess(self):
+        info = {"isolate_dso_base": 0x400000, "vm_dso_base": 0x800000}
+        self.assertIsNone(dart_image_base(info, 0x401000))
+
+    def test_missing_or_unparseable_data(self):
+        self.assertIsNone(dart_image_base({}, 0x401000))
+        self.assertIsNone(dart_image_base(DART_IMAGE_INFO, None))
+
+
+class DartFooterFrameTestCase(GlitchTestCase):
+    def test_pseudo_frames_detected(self):
+        for frame in DART_FOOTER_FRAMES:
+            self.assertTrue(is_dart_footer_frame(frame))
+
+    def test_regular_frames_not_detected(self):
+        self.assertFalse(is_dart_footer_frame({"function": "bK"}))
+        self.assertFalse(is_dart_footer_frame({"function": "main.dart:1"}))
+        self.assertFalse(is_dart_footer_frame(None))
+
+    def test_has_dart_frames(self):
+        self.assertTrue(has_dart_frames([{"platform": "dart"}]))
+        self.assertFalse(has_dart_frames([{"platform": "native"}]))
+        self.assertFalse(has_dart_frames([None, {}]))
+        self.assertFalse(has_dart_frames(None))
+
+
+class DartSymbolicationTestCase(GlitchTestCase):
+    """Resolve obfuscated Dart frames from the exact dart_image data."""
+
+    def resolve(
+        self, stacktrace, dart_image=None, debug_id=None, event_extra=None, offsets=None
+    ):
+        # Default symcache matches the default snapshot data: 0x402abc -
+        # 0x400000 = 0x2abc, 0x404def - 0x400000 = 0x4def. span covers the
+        # return-address minus one.
+        sym_cache = FakeSymCache(offsets or [0x2ABC, 0x4DEF], span=0x10)
+        sym_cache.arch = "arm64"
+        event = {
+            "contexts": {"os": {"name": "Android"}, "device": {"arch": "arm64"}},
+            **(event_extra or {}),
+            "exception": {"values": [{"stacktrace": stacktrace}]},
+        }
+        return StacktraceProcessor.resolve_stacktrace(
+            event, sym_cache, debug_id=debug_id, dart_image=dart_image
+        )
+
+    def test_resolves_dart_frames_from_exact_footer_base(self):
+        result = self.resolve(
+            {
+                "frames": [
+                    {
+                        "instruction_addr": "0x402abc",
+                        "function": "bK",
+                        "platform": "dart",
+                    },
+                    {
+                        "instruction_addr": "0x404def",
+                        "function": "bL",
+                        "platform": "dart",
+                    },
+                    # An engine (libflutter.so) address below the snapshot:
+                    # the snapshot's DIF cannot resolve it, keep as sent.
+                    {
+                        "instruction_addr": "0x1000",
+                        "function": "engineFn",
+                        "platform": "dart",
+                    },
+                    *DART_FOOTER_FRAMES,
+                ]
+            },
+            dart_image=DART_IMAGE_INFO,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result.score, 2)
+        # Footer pseudo-frames are dropped; the out-of-snapshot frame is
+        # kept as sent — but nothing is turned into a wrong name.
+        self.assertEqual(len(result.frames), 3)
+        self.assertTrue(result.frames[0]["resolved"])
+        self.assertTrue(result.frames[1]["resolved"])
+        self.assertNotIn("resolved", result.frames[2])
+
+    def test_resolves_dart_frames_from_context_without_footer(self):
+        # The SDK parsed the stack and dropped the footer; the app-attached
+        # dart_image context still carries the image data.
+        result = self.resolve(
+            {
+                "frames": [
+                    {"instruction_addr": "0x402abc", "function": "bK"},
+                    {"instruction_addr": "0x404def", "function": "bL"},
+                ]
+            },
+            dart_image=DART_IMAGE_INFO,
+        )
+        self.assertEqual(result.score, 2)
+        self.assertTrue(all(frame["resolved"] for frame in result.frames))
+
+    def test_no_estimation_for_dart_frames_without_image_data(self):
+        # FakeSymCache resolves at offsets that estimation WOULD find for
+        # these addresses (base 0x400000). A Dart slide is ambiguous, so no
+        # base may be guessed and no name may be attached.
+        sym_cache = FakeSymCache([0x2000, 0x4000])
+        sym_cache.arch = "arm64"
+        event = {
+            "contexts": {"os": {"name": "Android"}, "device": {"arch": "arm64"}},
+            "exception": {
+                "values": [
+                    {
+                        "stacktrace": {
+                            "frames": [
+                                {"instruction_addr": "0x402000", "platform": "dart"},
+                                {"instruction_addr": "0x404000", "platform": "dart"},
+                            ]
+                        }
+                    }
+                ]
+            },
+        }
+        result = StacktraceProcessor.resolve_stacktrace(event, sym_cache)
+        self.assertEqual(result.score, 0)
+        self.assertTrue(all(not frame.get("resolved") for frame in result.frames))
+        # The ambiguous Dart slide was never probed: only the two direct
+        # lookups at base 0 ran, hundreds of estimation probes did not.
+        self.assertEqual(len(sym_cache.lookups), 2)
+
+    def test_debug_meta_base_beats_dart_image(self):
+        result = self.resolve(
+            {"frames": [{"instruction_addr": "0x100abc", "platform": "dart"}]},
+            dart_image=DART_IMAGE_INFO,
+            debug_id="df398b02-1681-3b54-8fa5-b205e1ecfd7e",
+            # The symcache resolves 0x100abc - 0x100000 = 0xabc.
+            offsets=[0xABC],
+            event_extra={
+                "debug_meta": {
+                    "images": [
+                        {
+                            "type": "elf",
+                            "debug_id": "DF398B02-1681-3B54-8FA5-B205E1ECFD7E",
+                            "image_addr": "0x100000",
+                        }
+                    ]
+                }
+            },
+        )
+        # Resolved at 0x100abc - 0x100000 = 0xabc: the SDK-supplied base
+        # applies even when dart_image suggests a different one.
+        self.assertEqual(result.score, 1)
+        self.assertTrue(result.frames[0]["resolved"])
+
+    def test_dart_image_arch_gates_the_cache(self):
+        # No contexts.device.arch: the dart_image arch is the only source,
+        # and a cache built for another architecture must not be applied.
+        event = {
+            "contexts": {"os": {"name": "Android"}},
+            "exception": {
+                "values": [
+                    {"stacktrace": {"frames": [{"instruction_addr": "0x402abc"}]}}
+                ]
+            },
+        }
+        sym_cache = FakeSymCache([0x2ABC])
+        sym_cache.arch = "x86"
+        result = StacktraceProcessor.resolve_stacktrace(
+            event, sym_cache, dart_image=dict(DART_IMAGE_INFO, arch="arm64")
+        )
+        self.assertIsNone(result)
+
+        sym_cache.arch = "arm64"
+        result = StacktraceProcessor.resolve_stacktrace(
+            event, sym_cache, dart_image=dict(DART_IMAGE_INFO, arch="arm64")
+        )
+        self.assertEqual(result.score, 1)
+
+
+class CodeIdCandidateSelectionTestCase(GlitchTipTransactionTestCase):
+    """A Dart footer's build_id selects the exact DIF by its code_id."""
+
+    BUILD_ID = "b7188509241222671ab8064247a69c76"
+
+    def setUp(self):
+        self.create_logged_in_user()
+    DEBUG_ID = "df398b02-1681-3b54-8fa5-b205e1ecfd7e"
+
+    def make_dif(self, data):
+        return baker.make(
+            "difs.DebugInformationFile",
+            project=self.project,
+            data={"kind": "debug", "symbol_type": "native", **data},
+        )
+
+    def make_footer_event(self, **extra):
+        return ErrorIssueEventSchema(
+            platform="dart",
+            exception={
+                "values": [
+                    {
+                        "type": "Exception",
+                        "value": "test",
+                        "stacktrace": {
+                            "frames": [
+                                {
+                                    "instruction_addr": "0x402abc",
+                                    "function": "bK",
+                                    "platform": "dart",
+                                },
+                                *DART_FOOTER_FRAMES,
+                            ]
+                        },
+                    }
+                ]
+            },
+            contexts={"os": {"name": "Android"}, "device": {"arch": "arm64"}},
+            **extra,
+        )
+
+    def test_returns_debug_ids_of_matching_code_id(self):
+        self.make_dif({"code_id": self.BUILD_ID, "debug_id": self.DEBUG_ID})
+        self.make_dif(
+            {
+                "code_id": "deadbeef" * 8,
+                "debug_id": "11111111-1111-3111-8111-111111111111",
+            }
+        )
+        ids = async_to_sync(_code_id_debug_ids)(self.project.id, self.BUILD_ID)
+        self.assertEqual(ids, [self.DEBUG_ID])
+
+    def test_no_match_returns_empty(self):
+        self.make_dif({"code_id": "deadbeef" * 8, "debug_id": self.DEBUG_ID})
+        self.assertEqual(
+            async_to_sync(_code_id_debug_ids)(self.project.id, self.BUILD_ID), []
+        )
+
+    def test_proguard_and_source_files_are_not_candidates(self):
+        self.make_dif({"code_id": self.BUILD_ID, "symbol_type": "proguard"})
+        baker.make(
+            "difs.DebugInformationFile",
+            project=self.project,
+            data={"kind": "sources", "code_id": self.BUILD_ID},
+        )
+        self.assertEqual(
+            async_to_sync(_code_id_debug_ids)(self.project.id, self.BUILD_ID), []
+        )
+
+    def test_footer_event_consults_code_id_without_debug_meta(self):
+        with patch(
+            "apps.difs.tasks._code_id_debug_ids", new_callable=AsyncMock
+        ) as mock_ids:
+            mock_ids.return_value = []
+            async_to_sync(resolve_event_stacktraces)(
+                self.make_footer_event(), self.project.id
+            )
+        mock_ids.assert_awaited_once_with(self.project.id, self.BUILD_ID)
+
+    def test_debug_meta_ids_win_over_code_id(self):
+        event = self.make_footer_event(
+            debug_meta={
+                "images": [
+                    {
+                        "type": "elf",
+                        "debug_id": self.DEBUG_ID.upper(),
+                        "image_addr": "0x100000",
+                    }
+                ]
+            }
+        )
+        with patch(
+            "apps.difs.tasks._code_id_debug_ids", new_callable=AsyncMock
+        ) as mock_ids:
+            mock_ids.return_value = []
+            async_to_sync(resolve_event_stacktraces)(event, self.project.id)
+        mock_ids.assert_not_awaited()
