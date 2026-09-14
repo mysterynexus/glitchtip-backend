@@ -882,7 +882,12 @@ async def process_issue_events(
                 [
                     debug_file
                     for debug_file in event_debug_files
-                    if debug_file.release_id == release_id
+                    # release_id is None for artifact bundles; `None == None`
+                    # must not admit every org bundle into an unrelated event.
+                    if (
+                        debug_file.release_id is not None
+                        and debug_file.release_id == release_id
+                    )
                     or debug_file.data.get("code_file")
                 ],
             )
