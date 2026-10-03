@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import requests
 from allauth.socialaccount.models import SocialApp
-from django.test import TestCase, override_settings
+from django.test import AsyncClient, TestCase, override_settings
 from django.urls import reverse
 from model_bakery import baker
 from ninja.errors import HttpError
@@ -36,7 +36,10 @@ class OrganizationSocialAppAPITestCase(TestCase):
     @classmethod
     def setUpTestData(cls):
         cls.user = baker.make("users.user")
-        cls.organization = baker.make("organizations_ext.Organization")
+        cls.organization = baker.make(
+            "organizations_ext.Organization",
+            name="Organization with a long name for OIDC",
+        )
         cls.organization.add_user(cls.user)  # First user becomes OWNER
         cls.member = baker.make("users.user")
         cls.organization.add_user(cls.member, role=OrganizationUserRole.MEMBER)
@@ -172,42 +175,185 @@ class OrganizationSocialAppAPITestCase(TestCase):
         )
         self.assertEqual(res.status_code, 201)
 
-    async def test_update_never_writes_is_public(self):
-        """A PUT must not clobber an instance admin's Django-admin override,
-        including when the client sends isPublic itself."""
+    async def test_oidc_options_round_trip(self):
         await make_sso_subscription(self.organization)
+        options = {
+            "tokenAuthMethod": "client_secret_post",
+            "oauthPkceEnabled": True,
+            "fetchUserinfo": False,
+        }
+        res = await self.async_client.post(
+            self.list_url, {**VALID_PAYLOAD, **options}, "application/json"
+        )
+        self.assertEqual(res.status_code, 201)
+        data = res.json()
+        for key, value in options.items():
+            self.assertEqual(data[key], value)
+        app_id = data["id"]
+        app = await SocialApp.objects.aget(id=app_id)
+        self.assertEqual(
+            app.settings,
+            {
+                "server_url": VALID_PAYLOAD["serverUrl"],
+                "token_auth_method": "client_secret_post",
+                "oauth_pkce_enabled": True,
+                "fetch_userinfo": False,
+            },
+        )
+        url = reverse(
+            "api:update_organization_social_app", args=[self.organization.slug, app_id]
+        )
+        # Existing clients omit the new fields; their updates must preserve them.
+        res = await self.async_client.put(url, VALID_PAYLOAD, "application/json")
+        self.assertEqual(res.status_code, 200)
+        for key, value in options.items():
+            self.assertEqual(res.json()[key], value)
+        res = await self.async_client.put(
+            url,
+            {
+                **VALID_PAYLOAD,
+                "tokenAuthMethod": None,
+                "oauthPkceEnabled": False,
+                "fetchUserinfo": True,
+            },
+            "application/json",
+        )
+        self.assertEqual(res.status_code, 200)
+        app = await SocialApp.objects.aget(id=app_id)
+        self.assertNotIn("token_auth_method", app.settings)
+        self.assertFalse(app.settings["oauth_pkce_enabled"])
+        self.assertTrue(app.settings["fetch_userinfo"])
+        listed = (await self.async_client.get(self.list_url)).json()[0]
+        self.assertIsNone(listed["tokenAuthMethod"])
+        self.assertFalse(listed["oauthPkceEnabled"])
+        self.assertTrue(listed["fetchUserinfo"])
+        self.assertNotIn("sekrit", str(listed))
+
+    async def test_rejects_unsupported_token_auth_method(self):
+        await make_sso_subscription(self.organization)
+        res = await self.async_client.post(
+            self.list_url,
+            {
+                **VALID_PAYLOAD,
+                "tokenAuthMethod": "arbitrary-method",
+            },
+            "application/json",
+        )
+        self.assertEqual(res.status_code, 422)
+        self.assertFalse(await SocialApp.objects.aexists())
+
+    async def test_instance_options_require_superuser(self):
+        await make_sso_subscription(self.organization)
+        for field in ["isPublic", "emailAuthentication"]:
+            with self.subTest(field=field):
+                res = await self.async_client.post(
+                    self.list_url,
+                    {
+                        **VALID_PAYLOAD,
+                        field: True,
+                    },
+                    "application/json",
+                )
+                self.assertEqual(res.status_code, 403)
+        self.assertFalse(await SocialApp.objects.aexists())
         res = await self.async_client.post(
             self.list_url, VALID_PAYLOAD, "application/json"
         )
         app_id = res.json()["id"]
-        await OrganizationSocialApp.objects.aupdate(is_public=True)
         url = reverse(
-            "api:update_organization_social_app",
-            args=[self.organization.slug, app_id],
+            "api:update_organization_social_app", args=[self.organization.slug, app_id]
         )
-        res = await self.async_client.put(
-            url, {**VALID_PAYLOAD, "isPublic": False}, "application/json"
-        )
-        self.assertEqual(res.status_code, 200)
-        self.assertTrue(
+        for field in ["isPublic", "emailAuthentication"]:
+            with self.subTest(field=field):
+                res = await self.async_client.put(
+                    url,
+                    {
+                        **VALID_PAYLOAD,
+                        field: True,
+                        "name": "Must not persist",
+                    },
+                    "application/json",
+                )
+                self.assertEqual(res.status_code, 403)
+        app = await SocialApp.objects.aget(id=app_id)
+        self.assertEqual(app.name, VALID_PAYLOAD["name"])
+        self.assertNotIn("email_authentication", app.settings)
+        self.assertFalse(
             (await OrganizationSocialApp.objects.aget(social_app_id=app_id)).is_public
         )
 
-    @override_settings(BILLING_ENABLED=False, ENABLE_ORGANIZATION_CREATION=False)
-    async def test_is_public_not_settable_by_organization(self):
-        """Listing on the instance-wide login page is an instance-admin
-        decision, so the org API neither accepts nor reports the flag."""
-        res = await self.async_client.post(
-            self.list_url, {**VALID_PAYLOAD, "isPublic": True}, "application/json"
+    async def test_superuser_can_manage_instance_options_with_api_token(self):
+        await make_sso_subscription(self.organization)
+        self.user.is_superuser = True
+        await self.user.asave(update_fields=["is_superuser"])
+        token = await baker.amake("api_tokens.APIToken", user=self.user)
+        setattr(token.scopes, "org:admin", True)
+        await token.asave(update_fields=["scopes"])
+        client = AsyncClient(AUTHORIZATION=f"Bearer {token.token}")
+        res = await client.post(
+            self.list_url,
+            {
+                **VALID_PAYLOAD,
+                "isPublic": True,
+                "emailAuthentication": True,
+            },
+            "application/json",
         )
         self.assertEqual(res.status_code, 201)
-        self.assertNotIn("isPublic", res.json())
-        social_app_id = res.json()["id"]
-        self.assertFalse(
-            (
-                await OrganizationSocialApp.objects.aget(social_app_id=social_app_id)
-            ).is_public
+        data = res.json()
+        self.assertTrue(data["isPublic"])
+        self.assertTrue(data["emailAuthentication"])
+        public = (await client.get(reverse("api:get_settings"))).json()["socialApps"]
+        self.assertEqual([app["provider"] for app in public], [data["providerID"]])
+        url = reverse(
+            "api:update_organization_social_app",
+            args=[self.organization.slug, data["id"]],
         )
+        res = await client.put(url, VALID_PAYLOAD, "application/json")
+        self.assertEqual(res.status_code, 200)
+        self.assertTrue(res.json()["isPublic"])
+        self.assertTrue(res.json()["emailAuthentication"])
+        res = await client.put(
+            url,
+            {
+                **VALID_PAYLOAD,
+                "isPublic": False,
+                "emailAuthentication": False,
+            },
+            "application/json",
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertFalse(res.json()["isPublic"])
+        self.assertFalse(res.json()["emailAuthentication"])
+        self.assertEqual(
+            (await client.get(reverse("api:get_settings"))).json()["socialApps"], []
+        )
+
+    async def test_manager_cannot_modify_provider_trusted_for_email_authentication(
+        self,
+    ):
+        await make_sso_subscription(self.organization)
+        res = await self.async_client.post(
+            self.list_url, VALID_PAYLOAD, "application/json"
+        )
+        app = await SocialApp.objects.aget(id=res.json()["id"])
+        app.settings["email_authentication"] = True
+        await app.asave(update_fields=["settings"])
+        url = reverse(
+            "api:update_organization_social_app", args=[self.organization.slug, app.id]
+        )
+        # Changing a trusted issuer would let an org manager authenticate as existing users.
+        res = await self.async_client.put(
+            url,
+            {
+                **VALID_PAYLOAD,
+                "serverUrl": "https://other.example.com",
+            },
+            "application/json",
+        )
+        self.assertEqual(res.status_code, 403)
+        await app.arefresh_from_db()
+        self.assertEqual(app.settings["server_url"], VALID_PAYLOAD["serverUrl"])
 
     async def test_failed_link_leaves_no_orphan_social_app(self):
         """

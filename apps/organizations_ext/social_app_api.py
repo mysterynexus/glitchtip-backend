@@ -20,6 +20,7 @@ from django.shortcuts import aget_object_or_404
 from ninja import Router, Status
 from ninja.errors import HttpError
 
+from apps.users.models import User
 from glitchtip.api.authentication import AuthHttpRequest
 from glitchtip.api.permissions import has_permission
 from glitchtip.url_validation import is_ip_blocked
@@ -29,6 +30,7 @@ from .models import Organization, OrganizationSocialApp
 from .queryset_utils import get_organizations_queryset
 from .schema import (
     OrganizationSocialAppIn,
+    OrganizationSocialAppOptions,
     OrganizationSocialAppSchema,
     OrganizationSocialAppUpdateIn,
 )
@@ -134,10 +136,6 @@ def create_linked_social_app(
     Django's native acreate() runs on the sync connection, so it would not
     actually enclose these writes. Nothing awaits inside, so the transaction
     opens and closes within this one thread-sensitive call.
-
-    is_public is deliberately not settable here: listing a sign-in option on the
-    instance-wide login page is a server-level decision, so it stays an
-    instance-admin action in Django admin.
     """
     with transaction.atomic():
         social_app = SocialApp.objects.create(
@@ -149,9 +147,44 @@ def create_linked_social_app(
             settings=app_settings,
         )
         OrganizationSocialApp.objects.create(
-            organization=organization, social_app=social_app
+            organization=organization,
+            social_app=social_app,
+            is_public=payload.is_public or False,
         )
     return social_app
+
+
+async def check_instance_options_permission(request, payload, social_app=None):
+    # A trusted issuer must not become editable by an org manager: replacing it
+    # could grant access to existing accounts through verified-email matching.
+    if (
+        payload.is_public is not None
+        or "email_authentication" in payload.model_fields_set
+        or (social_app and (social_app.settings or {}).get("email_authentication"))
+    ) and not await User.objects.filter(
+        id=request.auth.user_id, is_active=True, is_superuser=True
+    ).aexists():
+        raise HttpError(403, "Instance authentication options require a superuser")
+
+
+def update_oidc_options(app_settings, payload):
+    for key, value in payload.model_dump(
+        include=set(OrganizationSocialAppOptions.model_fields), exclude_unset=True
+    ).items():
+        if value is None:
+            app_settings.pop(key, None)
+        else:
+            app_settings[key] = value
+
+
+@sync_to_async
+def save_social_app(social_app, payload):
+    with transaction.atomic():
+        social_app.save(update_fields=["name", "client_id", "secret", "settings"])
+        if payload.is_public is not None:
+            link = social_app.organizationsocialapp
+            link.is_public = payload.is_public
+            link.save(update_fields=["is_public"])
 
 
 @router.get(
@@ -184,6 +217,7 @@ async def create_organization_social_app(
         >= MAX_SOCIAL_APPS_PER_ORGANIZATION
     ):
         raise HttpError(400, "Maximum number of SSO providers reached")
+    await check_instance_options_permission(request, payload)
     app_settings = {}
     if preconfigured_url := PRECONFIGURED_SERVER_URLS.get(payload.provider):
         app_settings["server_url"] = preconfigured_url
@@ -192,6 +226,7 @@ async def create_organization_social_app(
         app_settings["server_url"] = validate_server_url(payload.server_url)
     else:
         raise HttpError(400, "Server URL is required")
+    update_oidc_options(app_settings, payload)
     social_app = await create_linked_social_app(
         organization,
         provider_id=await generate_provider_id(organization),
@@ -221,6 +256,7 @@ async def update_organization_social_app(
     )
     if social_app.provider != "openid_connect":
         raise HttpError(400, "Only OpenID Connect apps can be edited with this API")
+    await check_instance_options_permission(request, payload, social_app)
     social_app.name = payload.name
     social_app.client_id = payload.client_id
     if (social_app.settings or {}).get("brand") in PRECONFIGURED_SERVER_URLS:
@@ -234,7 +270,9 @@ async def update_organization_social_app(
         raise HttpError(400, "Server URL is required")
     if payload.client_secret:
         social_app.secret = payload.client_secret
-    await social_app.asave(update_fields=["name", "client_id", "secret", "settings"])
+    social_app.settings = dict(social_app.settings or {})
+    update_oidc_options(social_app.settings, payload)
+    await save_social_app(social_app, payload)
     return social_app
 
 

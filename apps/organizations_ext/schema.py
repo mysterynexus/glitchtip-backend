@@ -131,7 +131,25 @@ class OrganizationUserInviteSchema(OrganizationUserSchema):
         )
 
 
-class OrganizationSocialAppBase(CamelSchema):
+class OrganizationSocialAppOptions(CamelSchema):
+    """Omitted options are preserved on update; null restores allauth defaults."""
+
+    token_auth_method: Literal["client_secret_basic", "client_secret_post"] | None = (
+        None
+    )
+    oauth_pkce_enabled: bool | None = None
+    fetch_userinfo: bool | None = None
+    email_authentication: bool | None = Field(
+        default=None,
+        description="Trust verified provider emails for existing accounts. Superuser only.",
+    )
+
+
+class OrganizationSocialAppBase(OrganizationSocialAppOptions):
+    is_public: bool | None = Field(
+        default=None,
+        description="List on the instance login page. Superuser only; omitted or null preserves visibility.",
+    )
     name: str = Field(min_length=1, max_length=40)
     server_url: str | None = Field(default=None, max_length=500)
     """OIDC issuer or discovery document URL. Required for provider
@@ -165,7 +183,9 @@ class OrganizationSocialAppUpdateIn(OrganizationSocialAppBase):
     """Omit to keep the existing secret."""
 
 
-class OrganizationSocialAppSchema(CamelSchema, ModelSchema):
+class OrganizationSocialAppSchema(OrganizationSocialAppOptions, ModelSchema):
+    is_public: bool
+
     server_url: str | None
     brand: str
     """Identity provider brand for display (e.g. "google"); falls back to the
@@ -178,6 +198,26 @@ class OrganizationSocialAppSchema(CamelSchema, ModelSchema):
     class Meta:
         model = SocialApp
         fields = ["id", "name", "provider", "provider_id", "client_id"]
+
+    @staticmethod
+    def resolve_is_public(obj):
+        return obj.organizationsocialapp.is_public
+
+    @staticmethod
+    def resolve_token_auth_method(obj):
+        return (obj.settings or {}).get("token_auth_method")
+
+    @staticmethod
+    def resolve_oauth_pkce_enabled(obj):
+        return (obj.settings or {}).get("oauth_pkce_enabled")
+
+    @staticmethod
+    def resolve_fetch_userinfo(obj):
+        return (obj.settings or {}).get("fetch_userinfo")
+
+    @staticmethod
+    def resolve_email_authentication(obj):
+        return (obj.settings or {}).get("email_authentication")
 
     @staticmethod
     def resolve_server_url(obj):

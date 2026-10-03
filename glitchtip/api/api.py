@@ -155,6 +155,8 @@ def importer_failed(request: HttpRequest, exc: ImporterException):
 
 
 class SocialAppSchema(ModelSchema):
+    # OIDC exposes provider_id, which can exceed the provider field's 30 characters.
+    provider: str
     scopes: list[str]
     brand: str
     """Identity provider brand for display (e.g. picking a logo). Unlike
