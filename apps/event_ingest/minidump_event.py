@@ -1,7 +1,7 @@
+import bisect
 import io
 import logging
 import struct
-import uuid
 
 from gt_rust.symbolic import normalize_debug_id
 from minidump.directory import MINIDUMP_STREAM_TYPE
@@ -61,24 +61,32 @@ _KEPT_STREAMS: dict[MINIDUMP_STREAM_TYPE, int | None] = {
     MINIDUMP_STREAM_TYPE.SystemInfoStream: None,
 }
 _MAX_STREAMS = 1024
+# Real processes have tens to a few hundred threads and modules. Past this the
+# lists are truncated: every entry costs Python objects and an event field,
+# and a dump can otherwise claim ~100k of each within the size cap.
+_MAX_LIST_ITEMS = 4096
 
 
 def bound_minidump(data: bytes) -> bytes:
-    """Return a copy of ``data`` that is safe to hand to MinidumpFile.
+    """Return ``data``, or a copy of it, that is safe to hand to MinidumpFile.
 
     The ``minidump`` package trusts every count in the file and loops that
     many times, so a few crafted bytes can claim millions of streams or
     threads and exhaust memory. Reject any header, directory entry or list
-    count that doesn't fit inside the file, and mark the streams we never
-    read as unused so the package skips them rather than trusting their
-    counts too.
+    count that doesn't fit inside the file, truncate thread and module lists
+    to _MAX_LIST_ITEMS, and mark the streams we never read as unused so the
+    package skips them rather than trusting their counts too.
     """
     if len(data) < 32 or data[:4] != b"MDMP":
         raise InvalidMinidump("truncated header")
     count, dir_rva = struct.unpack_from("<II", data, 8)
-    if count > _MAX_STREAMS or dir_rva + count * 12 > len(data):
+    dir_end = dir_rva + count * 12
+    if count > _MAX_STREAMS or dir_end > len(data):
         raise InvalidMinidump("stream directory out of bounds")
-    bounded = bytearray(data)
+    # 4-byte rewrites, by offset: stream types in the directory, list counts
+    # in their streams. Spliced into one new buffer (none if nothing changes).
+    patches: dict[int, bytes] = {}
+    unused = struct.pack("<I", MINIDUMP_STREAM_TYPE.UnusedStream.value)
     for i in range(count):
         entry = dir_rva + i * 12
         stream_type, size, rva = struct.unpack_from("<III", data, entry)
@@ -89,9 +97,7 @@ def bound_minidump(data: bytes) -> bytes:
         except ValueError:
             kept = False
         if not kept:
-            struct.pack_into(
-                "<I", bounded, entry, MINIDUMP_STREAM_TYPE.UnusedStream.value
-            )
+            patches[entry] = unused
             continue
         item_size = _KEPT_STREAMS[MINIDUMP_STREAM_TYPE(stream_type)]
         if item_size is None:
@@ -101,7 +107,22 @@ def bound_minidump(data: bytes) -> bytes:
         (items,) = struct.unpack_from("<I", data, rva)
         if 4 + items * item_size > size:
             raise InvalidMinidump("list count exceeds stream size")
-    return bytes(bounded)
+        if items > _MAX_LIST_ITEMS:
+            if dir_rva - 4 < rva < dir_end:
+                raise InvalidMinidump("list count overlaps the directory")
+            patches[rva] = struct.pack("<I", _MAX_LIST_ITEMS)
+    if not patches:
+        return data
+    view = memoryview(data)
+    pieces = []
+    pos = 0
+    for offset in sorted(patches):
+        if offset < pos:
+            raise InvalidMinidump("overlapping streams")
+        pieces += (view[pos:offset], patches[offset])
+        pos = offset + 4
+    pieces.append(view[pos:])
+    return b"".join(pieces)
 
 
 def parse_cv_record_debug_id(cv_record_bytes: bytes) -> str | None:
@@ -187,17 +208,25 @@ def _extract_ip_from_context(
     return struct.unpack(fmt, raw)[0]
 
 
-def _find_module_for_addr(modules, addr: int) -> tuple[str | None, int | None]:
-    """Find which module contains the given address.
+class _ModuleIndex:
+    """Address -> containing module, by binary search over sorted bases."""
 
-    Returns (code_file, base_address) or (None, None).
-    """
-    if not modules:
+    def __init__(self, modules):
+        ranges = sorted(
+            (mod.baseaddress, mod.endaddress, mod.name)
+            for mod in (modules.modules if modules else ())
+        )
+        self._bases = [r[0] for r in ranges]
+        self._ranges = ranges
+
+    def find(self, addr: int) -> tuple[str | None, int | None]:
+        """Return (code_file, base_address) or (None, None)."""
+        i = bisect.bisect_right(self._bases, addr) - 1
+        if i >= 0:
+            base, end, name = self._ranges[i]
+            if addr < end:
+                return name, base
         return None, None
-    for mod in modules.modules:
-        if mod.baseaddress <= addr < mod.endaddress:
-            return mod.name, mod.baseaddress
-    return None, None
 
 
 def _build_debug_images(mf: MinidumpFile, image_type: str) -> list[dict]:
@@ -241,20 +270,15 @@ def _get_exception_name(exc_code: ExceptionCode) -> str:
     return name
 
 
-def minidump_to_event(data: bytes, sentry_meta: dict | None = None) -> dict:
-    """Parse a minidump binary and return an error event dict.
+def parse_minidump(data: bytes) -> dict:
+    """Parse a minidump binary into the event fields it can supply.
 
-    Args:
-        data: Raw minidump file bytes (must start with b'MDMP').
-        sentry_meta: Optional metadata from the 'sentry' multipart field
-                     (release, environment, tags, etc.).
-
-    Returns:
-        A dict suitable for validation with WebIngestIssueEvent.
+    Returns a dict suitable for validation with WebIngestIssueEvent, without
+    an event_id (the caller has the one the client knows the crash by):
+    exception (signal/exception code and the crashing frame), threads (one
+    frame per thread), debug_meta images, and the os/device contexts. Raises
+    InvalidMinidump for a file whose structure doesn't fit inside it.
     """
-    if sentry_meta is None:
-        sentry_meta = {}
-
     # The minidump library logs a noisy "PEB parsing error!" at ERROR level
     # via the root logger when memory segments are absent (normal for
     # crashpad/breakpad minidumps).  Suppress during parsing.
@@ -270,6 +294,7 @@ def minidump_to_event(data: bytes, sentry_meta: dict | None = None) -> dict:
     os_name, image_type = _get_os_and_image_type(mf)
     arch = _get_arch(mf)
     proc_arch = mf.sysinfo.ProcessorArchitecture if mf.sysinfo else None
+    module_index = _ModuleIndex(mf.modules)
 
     # --- Exception info ---
     exception_values = []
@@ -290,7 +315,7 @@ def minidump_to_event(data: bytes, sentry_meta: dict | None = None) -> dict:
         # Build crashing frame
         frames = []
         if crash_ip is not None:
-            package, image_addr = _find_module_for_addr(mf.modules, crash_ip)
+            package, image_addr = module_index.find(crash_ip)
             frame: dict = {
                 "instruction_addr": hex(crash_ip),
                 "in_app": True,
@@ -333,7 +358,7 @@ def minidump_to_event(data: bytes, sentry_meta: dict | None = None) -> dict:
                     proc_arch,
                 )
                 if ip and ip != 0:
-                    package, image_addr = _find_module_for_addr(mf.modules, ip)
+                    package, image_addr = module_index.find(ip)
                     frame = {"instruction_addr": hex(ip)}
                     if package:
                         frame["package"] = package
@@ -348,7 +373,6 @@ def minidump_to_event(data: bytes, sentry_meta: dict | None = None) -> dict:
 
     # --- Build event ---
     event: dict = {
-        "event_id": uuid.uuid4().hex,
         "platform": "native",
         "level": "fatal",
         "contexts": {
@@ -366,12 +390,53 @@ def minidump_to_event(data: bytes, sentry_meta: dict | None = None) -> dict:
     if debug_images:
         event["debug_meta"] = {"images": debug_images}
 
-    # Merge sentry metadata
-    if sentry_meta.get("release"):
-        event["release"] = sentry_meta["release"]
-    if sentry_meta.get("environment"):
-        event["environment"] = sentry_meta["environment"]
-    if sentry_meta.get("tags"):
-        event["tags"] = sentry_meta["tags"]
-
     return event
+
+
+# Event keys the minidump is the authority for when the SDK didn't send them.
+# An SDK that unwound the crash itself (sentry-native's in-process backend)
+# sends its own exception/threads, which beat a single frame per thread.
+_MINIDUMP_FILLS = ("exception", "threads", "debug_meta")
+
+
+def _is_empty(key: str, value) -> bool:
+    """Missing, or an interface with nothing in it (``{"values": []}``)."""
+    if isinstance(value, dict):
+        return not value.get("images" if key == "debug_meta" else "values")
+    return not value
+
+
+def merge_sdk_event(minidump_event: dict, sdk_event: dict | None) -> dict:
+    """Combine the event an SDK sent alongside a minidump with the dump.
+
+    The SDK event carries what only the client knows (release, environment,
+    user, tags, breadcrumbs, contexts, its event_id) and typically no
+    stack; the dump carries the crash. SDK values win wherever both have one,
+    except that the dump fills exception, threads and debug_meta when the SDK
+    left them empty, and its os/device context fields fill gaps in the SDK's.
+    """
+    if not sdk_event:
+        return minidump_event
+    event = dict(sdk_event)
+    for key in _MINIDUMP_FILLS:
+        if _is_empty(key, event.get(key)) and key in minidump_event:
+            event[key] = minidump_event[key]
+    contexts = event.get("contexts")
+    if not isinstance(contexts, dict):
+        contexts = {}
+    contexts = dict(contexts)
+    for name, value in minidump_event["contexts"].items():
+        sdk_value = contexts.get(name)
+        contexts[name] = (
+            value | sdk_value if isinstance(sdk_value, dict) else sdk_value or value
+        )
+    event["contexts"] = contexts
+    for key in ("platform", "level"):
+        if not event.get(key):
+            event[key] = minidump_event[key]
+    return event
+
+
+def minidump_to_event(data: bytes, sdk_event: dict | None = None) -> dict:
+    """Parse a minidump and merge in the event its SDK sent with it."""
+    return merge_sdk_event(parse_minidump(data), sdk_event)
