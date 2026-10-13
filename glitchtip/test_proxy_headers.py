@@ -4,7 +4,11 @@ from unittest import mock
 
 from django.test import SimpleTestCase
 
-from glitchtip.proxy_headers import ProxyHeaders
+from glitchtip.proxy_headers import (
+    _MAX_REPORTED_PROXIES,
+    ProxyHeaders,
+    parse_address,
+)
 
 # Real public addresses: documentation ranges such as 203.0.113.0/24 are not
 # global, which would hide mistakes in what counts as private.
@@ -204,3 +208,50 @@ class ProxyHeadersTestCase(SimpleTestCase):
         with self.assertLogs("glitchtip.proxy_headers", "WARNING"):
             wrapper = ProxyHeaders(echo_app, f"not-an-ip, {CDN_EDGE}")
         self.assertTrue(wrapper.is_trusted_peer(CDN_EDGE))
+
+    async def test_only_x_forwarded_for_is_read(self):
+        """Other client-IP headers are ignored; a proxy must send X-Forwarded-For.
+
+        Reading X-Real-IP (or CF-Connecting-IP, etc.) would make an operator who
+        forwards only that header believe throttling is keyed on the client when
+        it is keyed on the proxy. The address stays the trusted peer, unchanged.
+        """
+        for header in (
+            "x-real-ip",
+            "cf-connecting-ip",
+            "true-client-ip",
+            "forwarded",  # RFC 7239
+        ):
+            value = f"for={CLIENT}" if header == "forwarded" else CLIENT
+            with self.subTest(header):
+                scope = await resolve(None, "10.0.0.9", [(header, value)])
+                self.assertEqual(scope["client"][0], "10.0.0.9")
+
+    def test_reported_proxies_are_bounded(self):
+        """A client rotating source IPs can't grow the report set without bound.
+
+        ``report`` remembers proxies it has seen to log them once; the set is
+        capped so a forged, ever-changing peer can't make it grow unbounded.
+        """
+        wrapper = ProxyHeaders(echo_app)
+        client = parse_address(CLIENT)
+        for i in range(_MAX_REPORTED_PROXIES * 4):
+            wrapper.report(f"10.1.{i // 256}.{i % 256}", [], client)
+        self.assertLessEqual(len(wrapper.seen_proxies), _MAX_REPORTED_PROXIES)
+
+    async def test_malformed_forwarded_for_fails_safe(self):
+        """Malformed hops never raise and never promote junk to the client.
+
+        Each resolves toward the trusted peer/proxy rather than the forged left
+        side, so a parser edge case can't become a spoofed throttle key.
+        """
+        cases = [
+            # (label, headers, expected client)
+            ("empty element", xff(f"{CLIENT},,10.0.0.5"), "10.0.0.5"),
+            ("ipv6 zone id", xff("fe80::1%eth0, 10.0.0.5"), "10.0.0.5"),
+            ("garbage last hop", xff(f"{CLIENT}, garbage"), "10.0.0.9"),
+        ]
+        for label, headers, expected in cases:
+            with self.subTest(label):
+                scope = await resolve(None, "10.0.0.9", headers)
+                self.assertEqual(scope["client"][0], expected)
