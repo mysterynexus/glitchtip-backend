@@ -1,8 +1,11 @@
 import asyncio
 import contextlib
+import hashlib
+import io
 import json
 import logging
 import threading
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -95,8 +98,8 @@ class PublicIdTestCase(SimpleTestCase):
                 self.assertEqual(decode_with(self.aes, public), NO_ORG_ID)
 
     def test_zero_is_never_a_public_id(self):
-        # The internal value FF1 maps to 0. No key puts it inside int4 in any
-        # practical search, so widen the range to reach it.
+        # The internal value FF1 maps to 0. Under this key it falls outside
+        # int4, as it does for nearly every key, so widen the range to reach it.
         to_zero = public_id._unpermute(self.aes, public_id._ORG_TWEAK, 0)
         public = encode_with(self.aes, to_zero)
         self.assertNotEqual(public, 0)
@@ -251,6 +254,17 @@ class LoadPublicIdKeyTestCase(TransactionTestCase):
         await self.run_lifespan(inner)
         self.assertEqual(loaded_at_startup, [True])
 
+    async def test_lifespan_prints_key_fingerprint(self):
+        async def inner(scope, receive, send):
+            await receive()
+            await receive()
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            await self.run_lifespan(inner)
+        fingerprint = hashlib.sha256(("11" * 32).encode()).hexdigest()[:8]
+        self.assertIn(f"Public id key fingerprint: {fingerprint}", out.getvalue())
+
     async def test_failed_lifespan_load_still_starts(self):
         received = []
 
@@ -284,9 +298,9 @@ class LoadPublicIdKeyTestCase(TransactionTestCase):
 
         async def receive():
             if attempts:
-                # Hold shutdown back until the retry had its chance.
+                # Hold shutdown back until the retry finished: shutdown cancels it.
                 for _ in range(500):
-                    if public_id.key_loaded():
+                    if wrapper._retry is not None and wrapper._retry.done():
                         break
                     await asyncio.sleep(0.01)
             return next(messages)
@@ -298,14 +312,19 @@ class LoadPublicIdKeyTestCase(TransactionTestCase):
         async def send(_message):
             pass
 
+        wrapper = LoadPublicIdKey(inner)
+        out = io.StringIO()
         with (
             mock.patch.object(public_id, "load_key_sync", down_twice),
             mock.patch.object(LoadPublicIdKey, "RETRY_SECONDS", 0.01),
             self.assertLogs("glitchtip.asgi", "WARNING"),
+            redirect_stdout(out),
         ):
-            await LoadPublicIdKey(inner)({"type": "lifespan"}, receive, send)
+            await wrapper({"type": "lifespan"}, receive, send)
         self.assertTrue(public_id.key_loaded())
         self.assertEqual(len(attempts), 3)
+        # The operator's sign that the retry recovered.
+        self.assertIn("Public id key fingerprint:", out.getvalue())
 
     async def test_repeated_failures_log_one_line_naming_the_cause(self):
         class UndefinedTable(Exception):

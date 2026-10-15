@@ -1,22 +1,15 @@
 """Public organization ids.
 
-Organizations keep their sequential int4 primary key for every query, foreign
-key and partition. What the API shows is that key encrypted with NIST FF1
-(SP 800-38G) over 48 binary digits, so a public id reveals neither how many
-orgs exist nor when one was created, and still fits a JSON number.
+Org primary keys stay sequential int4; the API shows them FF1-encrypted (NIST
+SP 800-38G) over 48 bits, hiding org count and creation order while staying
+JSON-number safe. The bit width, cipher, tweak and key are permanent: changing
+any one changes every public id. [2**48, 2**53) is reserved for a future
+version that ``decode`` would pick by range; ``parse``'s digit cap must grow
+with it.
 
-Changing the bit width, the cipher, the tweak or the key changes every public
-id, so treat all four as permanent. Values in [2**48, 2**53) are reserved for
-future id versions: a new key or cipher would issue ids from that range, and
-``decode`` would pick the version by range, so ids already handed out keep
-working.
-
-The key is one ``PublicIdKey`` row, created by migration, or by the first
-process that finds it missing. It is loaded once per process into a module
-cache: from the ASGI lifespan (``glitchtip.asgi``), or on first use in sync
-code such as admin views and management commands. Servers read the row again
-every few minutes, so a restore that replaces it reaches every process
-without a restart.
+The key is one ``PublicIdKey`` row, made by migrate or by the first process
+to find it missing, and cached per process. Servers re-read it every few
+minutes, so a restored key reaches running processes.
 """
 
 import asyncio
@@ -47,10 +40,9 @@ _V1_LIMIT = 2**PUBLIC_ID_BITS
 _ORG_TWEAK = b"org"
 
 _aes: Cipher | None = None
-# Of the installed key, to tell a re-read of the same row from a new key.
+# Tells a re-read of the same key row from a new key.
 _key_digest: bytes | None = None
-# Set by the ASGI layer, which owns loading in a server (see
-# glitchtip.asgi.LoadPublicIdKey): starts its background retry.
+# Set by glitchtip.asgi.LoadPublicIdKey: starts its background retry.
 _load_trigger: Callable[[], None] | None = None
 
 
@@ -156,8 +148,7 @@ def decode_with(aes: Cipher, public: int) -> int:
 
 def encode(internal: int) -> int:
     """The public id for an internal organization id."""
-    # encode_with takes any value so tests can reach the edges; anything
-    # outside int4 here is a caller bug and would not decode back.
+    # Anything outside int4 is a caller bug and would not decode back.
     if not 1 <= internal <= MAX_ORG_ID:
         raise ValueError(f"Not an organization id: {internal!r}")
     return _encode_cached(_get_aes(), internal)
@@ -208,6 +199,16 @@ def _parse_input(value: object) -> int:
     return parse(value) if isinstance(value, str) else NO_ORG_ID
 
 
+def matching_ids(text: str) -> set[int]:
+    """Internal ids a pasted term could mean, read as a public id and as a raw one."""
+    text = text.strip()
+    ids = {parse(text)}
+    if text.isascii() and text.isdigit() and text[0] != "0" and len(text) <= 10:
+        ids.add(int(text) if int(text) <= MAX_ORG_ID else NO_ORG_ID)
+    ids.discard(NO_ORG_ID)
+    return ids
+
+
 # Response field: an internal id, sent as its public id string.
 OrgPublicId = Annotated[
     int, PlainSerializer(lambda internal: str(encode(internal)), return_type=str)
@@ -246,18 +247,18 @@ def _install(secret: SecretKey) -> None:
         logger.warning(
             "The public id key changed in the database (fingerprint now %s); "
             "every public id changed with it.",
-            digest.hex()[:8],
+            key_fingerprint(),
         )
-    else:
-        logger.info("Public id key loaded, fingerprint %s", digest.hex()[:8])
+
+
+def key_fingerprint() -> str | None:
+    """A short hash of the loaded key, to compare across a database move."""
+    return _key_digest.hex()[:8] if _key_digest else None
 
 
 def _test_key() -> SecretKey | None:
-    # Async test clients call Django directly, skipping the ASGI layer that
-    # loads the row, so tests read a key from settings instead. Only tests: a
-    # setting that picks the key would be a way to change every public id by
-    # accident. The test key is public, so it may sit in a local. None (as
-    # the row-backed tests override it) means read the row.
+    # Tests only: their clients skip the ASGI layer that loads the row, and a
+    # key setting elsewhere could change every id. None means read the row.
     if settings.TESTING:
         test_hex = getattr(settings, "PUBLIC_ID_TEST_KEY", None)
         if test_hex is not None:
@@ -346,9 +347,8 @@ def _get_aes() -> Cipher:
         except RuntimeError:
             load_key_sync()
         else:
-            # A sync ORM call here would raise SynchronousOnlyOperation, and
-            # blocking the loop on a thread would stall every request on it.
-            # Start the background load instead, so a later call succeeds.
+            # Not a sync ORM call (SynchronousOnlyOperation), nor a blocking
+            # one that stalls the loop: start the background load instead.
             if _load_trigger is not None:
                 _load_trigger()
             raise ImproperlyConfigured(

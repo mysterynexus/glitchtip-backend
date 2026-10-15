@@ -309,42 +309,17 @@ async def _recycle_db_connections():
 
 
 class LoadPublicIdKey:
-    """Load the public id key before anything in this process needs it.
-
-    Encoding an org id from async code cannot load the key itself: that would
-    be a sync ORM call inside the event loop. So it is loaded here, on lifespan
-    startup, before the inner apps (the embedded task worker among them) see
-    the startup message.
-
-    This is an ASGI wrapper rather than Django middleware because MCP requests
-    never pass through Django middleware, and MCP serializers encode org ids.
-    It must sit outside the vtasks wrapper, which consumes lifespan without
-    forwarding it.
-
-    A failed load is logged and startup continues, so ingest keeps working.
-    A background task then retries, backing off from ``RETRY_SECONDS`` to
-    ``RETRY_MAX_SECONDS``, until the key loads: the database may come up, or
-    migrate may run, long after this process started, and a pod with no
-    HTTP traffic still runs the task worker. On servers that never send
-    lifespan, the first request makes the first attempt, and async code
-    that needs the key early starts the retry through ``public_id``.
-
-    Each attempt runs on a thread of its own and is waited on for at most
-    ``LOAD_TIMEOUT_SECONDS``. Startup awaits it, and a hung database would
-    otherwise hold startup indefinitely, failing the readiness probe. The
-    thread cannot be cancelled, so it is the shared sync_to_async thread that
-    must stay out of it: a query stuck there would hold every later call
-    queued behind it, the connection cleanup included.
-
-    A failing load logs one line naming the likely cause, then stays quiet
-    until it succeeds: every worker retries, and a traceback per attempt
-    would bury the cause.
-
-    Once loaded, the row is read again every ``REVALIDATE_SECONDS``. A
-    restore or flush that replaces or deletes the row while the server runs
-    would otherwise leave old processes on the old key and new ones on the
-    new, each org then having two public ids until every process restarts.
-    A failed check keeps the key in hand.
+    """Load the public id key on lifespan startup, before the inner apps (the
+    task worker among them) start: async code can't load it without a sync ORM
+    call. An ASGI wrapper because MCP skips Django middleware, and outside the
+    vtasks wrapper, which swallows lifespan. A failed load is logged so ingest
+    still starts; a background task then retries with backoff until the key
+    loads, which covers pods with no HTTP traffic. On servers without lifespan
+    the first request makes the first attempt. ``LOAD_TIMEOUT_SECONDS`` bounds
+    each attempt, so a dead database can't hold startup. A failing load logs
+    one line naming the cause, then stays quiet until it loads. Once loaded,
+    the row is re-read every ``REVALIDATE_SECONDS``, so a restored key reaches
+    every process.
     """
 
     RETRY_SECONDS = 1.0
@@ -451,9 +426,14 @@ class LoadPublicIdKey:
                         "Could not load the public id key. Retrying in the background."
                     )
             return False
-        if self._failing:
-            self._failing = False
-            logger.info("Public id key loaded; public ids are available again.")
+        self._failing = False
+        # Printed like the banner: the default WARNING level hides info, and
+        # operators compare this value before and after a database move. After
+        # a failed load, it is also the sign that public ids work again.
+        print(
+            f"Public id key fingerprint: {public_id.key_fingerprint()}",
+            flush=True,
+        )
         self._start_revalidation()
         return True
 
