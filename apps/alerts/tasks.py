@@ -6,6 +6,7 @@ from django.db.models import Count
 from django.tasks import task
 from django.utils import timezone
 
+from apps.issue_events.constants import EventStatus
 from apps.issue_events.models import Issue
 from glitchtip.partition_manager import UUID7Helper
 
@@ -58,6 +59,8 @@ async def process_event_alerts():
             # Filter by UUIDv7 which encodes timestamp (enables partition pruning)
             "issueevent__id__gte": start_uuid,
             "issueevent__organization_id": alert.project.organization_id,
+            # Lets Postgres prune the hash-partitioned IssueIndex join below.
+            "index__organization_id": alert.project.organization_id,
         }
         if alert.environments:
             # Must stay in the same filter() call as the conditions above. Django
@@ -70,6 +73,7 @@ async def process_event_alerts():
         issues = (
             Issue.objects.filter(project_id=alert.project_id, **event_filters)
             .exclude(notification__project_alert=alert)
+            .exclude(index__status=EventStatus.IGNORED)
             .annotate(num_events=Count("issueevent"))
             .filter(num_events__gte=quantity_in_timespan)
             .values_list("id", flat=True)

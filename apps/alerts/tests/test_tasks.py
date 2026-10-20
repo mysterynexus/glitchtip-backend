@@ -288,6 +288,28 @@ class AlertTestCase(GlitchTipTransactionTestCase):
         process_event_alerts.call()
         self.assertEqual(len(mail.outbox), 2)
 
+    def test_ignored_issue_does_not_alert(self):
+        baker.make(
+            "alerts.ProjectAlert",
+            project=self.project,
+            timespan_minutes=1,
+            quantity=1,
+        )
+        ignored, unresolved = baker.make(
+            "issue_events.Issue", project=self.project, _quantity=2
+        )
+        IssueIndex.objects.filter(issue=ignored).update(status=EventStatus.IGNORED)
+        for issue in (ignored, unresolved):
+            baker.make(
+                "issue_events.IssueEvent",
+                issue=issue,
+                organization=self.organization,
+            )
+
+        process_event_alerts.call()
+        notification = Notification.objects.get()
+        self.assertQuerySetEqual(notification.issues.all(), [unresolved])
+
     def test_alert_subscription_default_scope(self):
         """Subscribe by default should not result in alert emails for non-team members"""
         baker.make(
