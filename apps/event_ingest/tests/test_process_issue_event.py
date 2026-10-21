@@ -4,6 +4,7 @@ import shutil
 import tempfile
 import uuid
 import zipfile
+from datetime import timedelta
 from hashlib import sha1
 from unittest import mock
 
@@ -352,6 +353,75 @@ class IssueEventIngestTestCase(EventIngestTestCase):
         self.process_events(data)
         issue.refresh_from_db()
         self.assertEqual(issue.status, EventStatus.UNRESOLVED)
+
+    def test_resolve_in_release_no_reopen_older_release(self):
+        """An event from a release OLDER than resolved_in_release must not reopen.
+
+        Builds shipped before the fixing release keep reporting the bug for a
+        long time while users update; those events are washing-out noise, not
+        a regression. Only a newer release may reopen a release-resolved issue.
+        """
+        data = self.get_json_data("events/test_data/py_hi_event.json")
+        old_release = baker.make(
+            "releases.Release", version="v0.9.0", organization=self.organization
+        )
+        Release.objects.filter(pk=old_release.pk).update(
+            created=timezone.now() - timedelta(days=30)
+        )
+        self.process_events(data)
+        issue = Issue.objects.first()
+        anchor_release = issue.first_release
+        Release.objects.filter(pk=anchor_release.pk).update(created=timezone.now())
+
+        issue.resolved_in_release = anchor_release
+        issue.save(update_fields=["resolved_in_release"])
+        IssueIndex.objects.filter(issue=issue).update(status=EventStatus.RESOLVED)
+
+        older_event = dict(data, release="v0.9.0")
+        self.process_events(older_event)
+
+        issue.refresh_from_db()
+        self.assertEqual(issue.status, EventStatus.RESOLVED)
+        self.assertEqual(issue.resolved_in_release, anchor_release)
+
+    def test_resolve_in_release_reopen_newer_release(self):
+        """An event from a release NEWER than resolved_in_release must reopen."""
+        data = self.get_json_data("events/test_data/py_hi_event.json")
+        self.process_events(data)
+        issue = Issue.objects.first()
+        anchor_release = issue.first_release
+        Release.objects.filter(pk=anchor_release.pk).update(
+            created=timezone.now() - timedelta(days=1)
+        )
+
+        issue.resolved_in_release = anchor_release
+        issue.save(update_fields=["resolved_in_release"])
+        IssueIndex.objects.filter(issue=issue).update(status=EventStatus.RESOLVED)
+
+        newer_event = dict(data, release="v2.0.0")
+        self.process_events(newer_event)
+
+        issue.refresh_from_db()
+        self.assertEqual(issue.status, EventStatus.UNRESOLVED)
+        self.assertIsNone(issue.resolved_in_release)
+
+    def test_resolve_in_release_no_reopen_event_without_release(self):
+        """An event without a release must not reopen a release-resolved issue."""
+        data = self.get_json_data("events/test_data/py_hi_event.json")
+        self.process_events(data)
+        issue = Issue.objects.first()
+        release = issue.first_release
+
+        issue.resolved_in_release = release
+        issue.save(update_fields=["resolved_in_release"])
+        IssueIndex.objects.filter(issue=issue).update(status=EventStatus.RESOLVED)
+
+        without_release = dict(data)
+        without_release.pop("release", None)
+        self.process_events(without_release)
+
+        issue.refresh_from_db()
+        self.assertEqual(issue.status, EventStatus.RESOLVED)
 
     def test_event_environment(self):
         # Some noise to test queries
