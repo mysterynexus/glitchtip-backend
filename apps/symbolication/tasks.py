@@ -45,6 +45,10 @@ _executor_lock = threading.Lock()
 # Cache builds at once per process.
 BUILD_CONCURRENCY = 1
 
+# The build memory budget when GLITCHTIP_SYMBOLICATION_BUILD_MEMORY_MB is not
+# set.
+DEFAULT_BUILD_MEMORY_MB = 700
+
 # Peak build memory per input byte, as measured; each input cap is the
 # build memory budget over its ratio. At the default 700 MB budget the caps
 # are 64 MB (sourcemap and minified file together), 384 MB (native debug
@@ -86,9 +90,14 @@ def container_memory_limit() -> int | None:
 
 
 def build_memory_mb() -> int:
-    """The build memory budget: the setting, lowered to a share of the
-    container's memory limit when that is smaller. Logged once when lowered."""
+    """The build memory budget: the setting if an operator set one, else the
+    default, lowered to a share of the container's memory limit when that is
+    smaller. Logged once when lowered. A budget set on purpose is not lowered:
+    it is how an operator allows larger builds in a small container."""
     budget = settings.GLITCHTIP_SYMBOLICATION_BUILD_MEMORY_MB
+    if budget is not None:
+        return budget
+    budget = DEFAULT_BUILD_MEMORY_MB
     limit = container_memory_limit()
     if limit is None:
         return budget
@@ -99,8 +108,9 @@ def build_memory_mb() -> int:
         _reported_budgets.add(share)
         logger.info(
             "Symbolication cache builds may use %d MB, %d%% of this "
-            "container's %d MB memory limit (GLITCHTIP_SYMBOLICATION_"
-            "BUILD_MEMORY_MB is %d). Larger uploads are not symbolicated.",
+            "container's %d MB memory limit (the default budget is %d MB; "
+            "set GLITCHTIP_SYMBOLICATION_BUILD_MEMORY_MB to choose another). "
+            "Larger uploads are not symbolicated.",
             share,
             round(CONTAINER_MEMORY_SHARE * 100),
             limit // MB,

@@ -36,6 +36,20 @@ class MegabytesSettingTests(SimpleTestCase):
                 self.assertEqual(self.parse(raw), 700)
 
 
+class MegabytesSettingWithoutDefaultTests(SimpleTestCase):
+    def test_unset_is_none_so_a_default_can_be_told_from_a_choice(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop(NAME, None)
+            self.assertIsNone(_megabytes_setting(NAME, None))
+        with mock.patch.dict(os.environ, {NAME: "700"}):
+            self.assertEqual(_megabytes_setting(NAME, None), 700)
+        with (
+            mock.patch.dict(os.environ, {NAME: "lots"}),
+            self.assertWarnsRegex(RuntimeWarning, "ignoring it"),
+        ):
+            self.assertIsNone(_megabytes_setting(NAME, None))
+
+
 class StorageSpoolTests(SimpleTestCase):
     def test_spools_past_4_mb_with_a_temporary_directory(self):
         self.assertEqual(_storage_spool_bytes(), 4 * 1024 * 1024)

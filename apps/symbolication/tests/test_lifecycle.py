@@ -934,6 +934,11 @@ class ContainerMemoryTests(CacheTestCase):
             [18, 112, 14],
         )
 
+    def test_a_budget_set_by_the_operator_is_not_lowered(self):
+        self.limit(self.v2, str(512 * 1024 * 1024))
+        with override_settings(GLITCHTIP_SYMBOLICATION_BUILD_MEMORY_MB=700):
+            self.assertEqual(tasks.build_memory_mb(), 700)
+
     def test_a_large_or_unknown_limit_keeps_the_setting(self):
         for name, path, value in [
             ("large", self.v2, str(64 * 1024**3)),

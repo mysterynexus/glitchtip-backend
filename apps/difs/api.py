@@ -88,10 +88,10 @@ def _mapping_too_large(cap: int, size: int | None = None) -> str:
     """The refusal an upload tool shows. It names no setting: on a hosted
     instance the user cannot change one."""
     logger.warning(
-        "Refused a ProGuard mapping over the size cap of %d bytes; raise "
-        "GLITCHTIP_SYMBOLICATION_BUILD_MEMORY_MB (and the memory limit of "
-        "the container that builds symbolication caches) to allow larger "
-        "mappings.",
+        "Refused a ProGuard mapping over the size cap of %d bytes. Set "
+        "GLITCHTIP_SYMBOLICATION_BUILD_MEMORY_MB to allow larger mappings, "
+        "and give the container that builds symbolication caches the memory "
+        "for them.",
         cap,
     )
     accepts = f"this server accepts mappings up to {cap // MB} MB"
