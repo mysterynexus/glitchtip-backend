@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import logging
 import lzma
 import tempfile
 import zipfile
@@ -29,6 +30,8 @@ from apps.files.assemble import (
 )
 from apps.files.models import File, FileBlob
 from apps.projects.models import Project
+from apps.symbolication.store import MB
+from apps.symbolication.tasks import proguard_mapping_cap
 from glitchtip.api.decorators import optional_slash
 from glitchtip.api.permissions import OrgScopedHttpRequest, org_scoped
 from sentry.utils.zip import ZipExtractionLimitExceeded, _reject_oversized_input
@@ -48,6 +51,8 @@ from .tasks import (
     chunks_are_not_a_mapping,
     difs_assemble,
 )
+
+logger = logging.getLogger(__name__)
 
 MAX_UPLOAD_BLOB_SIZE = 32 * 1024 * 1024  # 32MB
 _DIF_READ_CHUNK_SIZE = 64 * 1024
@@ -77,6 +82,36 @@ def _corrupt_zip_is_a_bad_request():
 
 
 router = Router()
+
+
+def _mapping_too_large(cap: int, size: int | None = None) -> str:
+    """The refusal an upload tool shows. It names no setting: on a hosted
+    instance the user cannot change one."""
+    logger.warning(
+        "Refused a ProGuard mapping over the size cap of %d bytes; raise "
+        "GLITCHTIP_SYMBOLICATION_BUILD_MEMORY_MB (and the memory limit of "
+        "the container that builds symbolication caches) to allow larger "
+        "mappings.",
+        cap,
+    )
+    accepts = f"this server accepts mappings up to {cap // MB} MB"
+    if size is None:
+        return f"ProGuard mapping is too large; {accepts}"
+    return f"ProGuard mapping is {-(-size // MB)} MB; {accepts}"
+
+
+def _proguard_refusal(chunks: list[str]) -> str | None:
+    """Why a file named as a mapping is refused at assemble, if it is."""
+    if chunks_are_not_a_mapping(chunks):
+        return "not a ProGuard mapping"
+    sizes = dict(
+        FileBlob.objects.filter(checksum__in=set(chunks)).values_list(
+            "checksum", "size"
+        )
+    )
+    size = sum(sizes.get(checksum) or 0 for checksum in chunks)
+    cap = proguard_mapping_cap()
+    return _mapping_too_large(cap, size) if size > cap else None
 
 
 @optional_slash(
@@ -147,10 +182,10 @@ async def difs_assemble_api(
             }
             continue
 
-        if extract_proguard_id(name) and await sync_to_async(chunks_are_not_a_mapping)(
-            chunks
-        ):
-            detail = "not a ProGuard mapping"
+        detail = None
+        if extract_proguard_id(name):
+            detail = await sync_to_async(_proguard_refusal)(chunks)
+        if detail:
             await sync_to_async(set_assemble_status)(
                 AssembleTask.DIF,
                 project.id,
@@ -190,9 +225,12 @@ async def project_reprocessing(
     await aget_object_or_404(qs.only("id"), slug=project_slug.lower())
 
 
-def _spool_entry(entry, head: bytes, out, size_budget: int) -> tuple[str, int]:
+def _spool_entry(
+    entry, head: bytes, out, size_budget: int, max_size: int
+) -> tuple[str, int]:
     """Copy a zip entry to ``out`` in chunks, returning its SHA-1 and size.
-    Off the event loop: inflating up to the whole budget takes seconds."""
+    Off the event loop: inflating up to the whole budget takes seconds.
+    Stops at ``max_size``, so a mapping too large to build is not written."""
     hasher = sha1()
     size = 0
     chunk = head
@@ -200,6 +238,8 @@ def _spool_entry(entry, head: bytes, out, size_budget: int) -> tuple[str, int]:
         size += len(chunk)
         if size > size_budget:
             raise HttpError(400, "Uploaded file expands too large")
+        if size > max_size:
+            raise HttpError(400, _mapping_too_large(max_size))
         hasher.update(chunk)
         out.write(chunk)
         with _corrupt_zip_is_a_bad_request():
@@ -231,7 +271,7 @@ async def create_dif_from_read_only_file(
         # The checksum is known only once the whole entry is read, so the
         # temp file is written even when the blob turns out to exist already.
         checksum, size = await sync_to_async(_spool_entry)(
-            proguard_file, head, tmp, size_budget
+            proguard_file, head, tmp, size_budget, proguard_mapping_cap()
         )
 
         blob = await FileBlob.objects.filter(checksum=checksum).afirst()

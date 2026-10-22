@@ -18,6 +18,7 @@ from django.core.files.storage import default_storage
 from django.test import override_settings
 from django.utils import timezone
 
+from apps.difs.models import DebugInformationFile
 from apps.event_ingest.process_event import process_issue_events
 from apps.event_ingest.schema import ErrorIssueEventSchema, IssueTaskMessage
 from apps.event_ingest.tests.symbolication import (
@@ -25,11 +26,13 @@ from apps.event_ingest.tests.symbolication import (
     ELF_IMAGE_ADDR,
     IN_MEMORY_STORAGE,
     NATIVE_FIXTURES,
+    PROGUARD_FIXTURES,
     crash_frame_offsets,
     measure_symbolication,
     store_blob,
     upload_copies,
     upload_native_dif,
+    upload_proguard_mapping,
 )
 from apps.event_ingest.tests.utils import EventIngestTestCase, run_async_closing
 from apps.files.models import FileBlob
@@ -263,6 +266,29 @@ class BuildTests(CacheTestCase):
         with mock.patch.object(tasks, "_build") as build:
             self.build(row.id)
         build.assert_not_called()
+        row.refresh_from_db()
+        self.assertEqual(row.state, CacheState.FAILED)
+        self.assertEqual(row.attempts, store.MAX_ATTEMPTS)
+
+    def test_a_proguard_mapping_over_the_cap_is_refused_before_its_blob_is_read(self):
+        upload_proguard_mapping(
+            self.project,
+            (PROGUARD_FIXTURES / "mapping.txt").read_bytes(),
+            str(uuid.uuid4()),
+        )
+        blob = DebugInformationFile.objects.get(project=self.project).file.blob
+        row = SymbolicationCache.objects.create(
+            kind=CacheKind.PROGUARD,
+            cache_key=blob.checksum,
+            format_tag=store.format_tag(CacheKind.PROGUARD),
+            source_blob_id=blob.id,
+        )
+        with (
+            override_settings(GLITCHTIP_SYMBOLICATION_BUILD_MEMORY_MB=0),
+            mock.patch.object(tasks, "blob_input") as opened,
+        ):
+            self.build(row.id)
+        opened.assert_not_called()
         row.refresh_from_db()
         self.assertEqual(row.state, CacheState.FAILED)
         self.assertEqual(row.attempts, store.MAX_ATTEMPTS)

@@ -114,6 +114,11 @@ def input_cap(ratio: float) -> int:
     return int(build_memory_mb() / ratio) * MB
 
 
+def proguard_mapping_cap() -> int:
+    """The largest ProGuard mapping, in bytes, that can be built into a cache."""
+    return input_cap(PROGUARD_PEAK_RATIO)
+
+
 class InputTooLarge(Exception):
     """A build input is over its size cap."""
 
@@ -140,7 +145,10 @@ def _check_input_size(row: SymbolicationCache):
         size = row.source_blob.size or 0
         cap = input_cap(SYMCACHE_PEAK_RATIO)
     else:
-        return  # gt_rust applies the ProGuard cap itself
+        # gt_rust applies the same cap as a backstop, but only after the blob
+        # is opened.
+        size = row.source_blob.size or 0
+        cap = proguard_mapping_cap()
     if size > cap:
         raise InputTooLarge(f"input is {size} bytes, cap is {cap}")
 
@@ -159,7 +167,7 @@ def _build_args(row: SymbolicationCache, source, sourcemap) -> tuple[tuple, dict
         }
     return (source,), {
         "source_digest": digest,
-        "max_mapping_bytes": input_cap(PROGUARD_PEAK_RATIO),
+        "max_mapping_bytes": proguard_mapping_cap(),
     }
 
 
