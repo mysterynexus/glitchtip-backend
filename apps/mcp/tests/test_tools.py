@@ -30,6 +30,7 @@ from apps.mcp.serializers import (
     serialize_project,
 )
 from apps.mcp.server import _check_scopes, _parse_datetime
+from apps.organizations_ext.public_id import encode
 from glitchtip.partition_manager import UUID7Helper
 from glitchtip.test_utils.issue import amake_issue, make_issue
 
@@ -586,7 +587,7 @@ class SerializerTest(TestCase):
 
     def test_serialize_organization(self):
         result = serialize_organization(self.organization)
-        self.assertEqual(result["id"], str(self.organization.id))
+        self.assertEqual(result["id"], str(encode(self.organization.id)))
         self.assertEqual(result["name"], self.organization.name)
         self.assertEqual(result["slug"], self.organization.slug)
         self.assertIn("dateCreated", result)
@@ -596,6 +597,9 @@ class SerializerTest(TestCase):
         self.assertEqual(result["id"], str(self.project.id))
         self.assertEqual(result["name"], self.project.name)
         self.assertIn("slug", result)
+        self.assertEqual(
+            result["organization"]["id"], str(encode(self.organization.id))
+        )
 
     def test_serialize_issue(self):
         now = timezone.now()
@@ -658,6 +662,7 @@ class SerializerTest(TestCase):
         self.assertEqual(result["name"], "Uptime Check")
         self.assertEqual(result["url"], "https://example.com")
         self.assertEqual(result["interval"], 60)
+        self.assertEqual(result["organizationId"], str(encode(self.organization.id)))
 
 
 class ParseDatetimeTest(TestCase):

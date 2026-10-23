@@ -572,3 +572,21 @@ class OrganizationSocialApp(models.Model):
         "the organization's own login page. Settable here only — the "
         "organization API never writes it.",
     )
+
+
+class PublicIdKey(models.Model):
+    """The key public ids are encrypted with; see ``public_id``.
+
+    One row, shared by every kind of public id: each kind encrypts under its
+    own FF1 tweak, so a second kind needs no second key. Created by migration,
+    or by the first process that finds it missing, so a restore without this
+    row gets a new key. Losing or replacing it changes every public id.
+    """
+
+    id = models.PositiveSmallIntegerField(primary_key=True, default=1)
+    key = models.CharField(max_length=64)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(condition=Q(id=1), name="publicidkey_single_row")
+        ]

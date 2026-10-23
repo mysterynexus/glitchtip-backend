@@ -8,6 +8,7 @@ https://docs.djangoproject.com/en/dev/howto/deployment/asgi/
 """
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
@@ -210,8 +211,15 @@ class MCPDjangoDispatcher:
 from asgiref.sync import sync_to_async
 from django.conf import settings
 from django.contrib.staticfiles import finders
-from django.db import close_old_connections
+from django.db import (
+    InterfaceError,
+    OperationalError,
+    ProgrammingError,
+    close_old_connections,
+    connections,
+)
 
+from apps.organizations_ext import public_id
 from glitchtip.async_db import recycle_async_connections
 
 
@@ -298,6 +306,184 @@ async def _recycle_db_connections():
             await asyncio.shield(sync_to_async(close_old_connections)())
     except Exception:
         logger.exception("Failed to recycle DB connections for MCP request")
+
+
+class LoadPublicIdKey:
+    """Load the public id key before anything in this process needs it.
+
+    Encoding an org id from async code cannot load the key itself: that would
+    be a sync ORM call inside the event loop. So it is loaded here, on lifespan
+    startup, before the inner apps (the embedded task worker among them) see
+    the startup message.
+
+    This is an ASGI wrapper rather than Django middleware because MCP requests
+    never pass through Django middleware, and MCP serializers encode org ids.
+    It must sit outside the vtasks wrapper, which consumes lifespan without
+    forwarding it.
+
+    A failed load is logged and startup continues, so ingest keeps working.
+    A background task then retries, backing off from ``RETRY_SECONDS`` to
+    ``RETRY_MAX_SECONDS``, until the key loads: the database may come up, or
+    migrate may run, long after this process started, and a pod with no
+    HTTP traffic still runs the task worker. On servers that never send
+    lifespan, the first request makes the first attempt, and async code
+    that needs the key early starts the retry through ``public_id``.
+
+    Each attempt runs on a thread of its own and is waited on for at most
+    ``LOAD_TIMEOUT_SECONDS``. Startup awaits it, and a hung database would
+    otherwise hold startup indefinitely, failing the readiness probe. The
+    thread cannot be cancelled, so it is the shared sync_to_async thread that
+    must stay out of it: a query stuck there would hold every later call
+    queued behind it, the connection cleanup included.
+
+    A failing load logs one line naming the likely cause, then stays quiet
+    until it succeeds: every worker retries, and a traceback per attempt
+    would bury the cause.
+
+    Once loaded, the row is read again every ``REVALIDATE_SECONDS``. A
+    restore or flush that replaces or deletes the row while the server runs
+    would otherwise leave old processes on the old key and new ones on the
+    new, each org then having two public ids until every process restarts.
+    A failed check keeps the key in hand.
+    """
+
+    RETRY_SECONDS = 1.0
+    RETRY_MAX_SECONDS = 10.0
+    LOAD_TIMEOUT_SECONDS = 5.0
+    REVALIDATE_SECONDS = 300.0
+
+    def __init__(self, app):
+        self.app = app
+        self._retry: asyncio.Task | None = None
+        self._revalidate: asyncio.Task | None = None
+        self._attempt: asyncio.Future | None = None
+        self._failing = False
+        public_id.set_load_trigger(self._start_retry)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "lifespan":
+            receive = self._lifespan_receive(receive)
+        elif (
+            not public_id.key_loaded()
+            and not self._retrying()
+            and not await self._load()
+        ):
+            self._start_retry()
+        await self.app(scope, receive, send)
+
+    def _lifespan_receive(self, receive):
+        async def wrapped():
+            message = await receive()
+            if message["type"] == "lifespan.startup":
+                if not await self._load():
+                    self._start_retry()
+            elif message["type"] == "lifespan.shutdown":
+                self._stop_background()
+            return message
+
+        return wrapped
+
+    def _retrying(self) -> bool:
+        return self._retry is not None and not self._retry.done()
+
+    def _stop_background(self) -> None:
+        for task in (self._retry, self._revalidate):
+            if task is not None:
+                task.cancel()
+
+    def _start_retry(self) -> None:
+        if not self._retrying():
+            # Held on self: the loop keeps only a weak reference to a task.
+            self._retry = asyncio.get_running_loop().create_task(
+                self._retry_until_loaded()
+            )
+
+    async def _retry_until_loaded(self):
+        delay = self.RETRY_SECONDS
+        while not public_id.key_loaded():
+            await asyncio.sleep(delay)
+            if await self._load():
+                return
+            delay = min(delay * 2, self.RETRY_MAX_SECONDS)
+
+    def _start_revalidation(self) -> None:
+        if self._revalidate is None or self._revalidate.done():
+            self._revalidate = asyncio.get_running_loop().create_task(
+                self._revalidate_forever()
+            )
+
+    async def _revalidate_forever(self):
+        while True:
+            await asyncio.sleep(self.REVALIDATE_SECONDS)
+            # The key in hand keeps working when this fails: a database that
+            # is down shows up everywhere else, and the next pass tries again.
+            with contextlib.suppress(Exception):
+                await self._run_attempt()
+
+    async def _run_attempt(self) -> None:
+        # One attempt at a time. A timed-out attempt holds its thread until the
+        # database answers, so the next try waits on it rather than starting
+        # another: a fresh thread per retry would drain the default executor,
+        # which the loop's DNS lookups (getaddrinfo) share.
+        if self._attempt is None or self._attempt.done():
+            self._attempt = asyncio.ensure_future(
+                sync_to_async(_load_key_in_thread, thread_sensitive=False)()
+            )
+        # Shielded: a timeout stops this wait, not the attempt.
+        await asyncio.wait_for(asyncio.shield(self._attempt), self.LOAD_TIMEOUT_SECONDS)
+
+    async def _load(self) -> bool:
+        timeout = self.LOAD_TIMEOUT_SECONDS
+        try:
+            await self._run_attempt()
+        except Exception as exc:
+            if not self._failing:
+                self._failing = True
+                if cause := _load_failure_cause(exc, timeout):
+                    logger.warning(
+                        "Public ids are unavailable until their key loads: %s. "
+                        "Retrying in the background.",
+                        cause,
+                    )
+                else:
+                    # Unexpected, so worth its traceback, once.
+                    logger.exception(
+                        "Could not load the public id key. Retrying in the background."
+                    )
+            return False
+        if self._failing:
+            self._failing = False
+            logger.info("Public id key loaded; public ids are available again.")
+        self._start_revalidation()
+        return True
+
+
+def _load_key_in_thread() -> None:
+    # On a thread of its own, not the one every thread-sensitive sync_to_async
+    # call shares: a hung database then stalls only this attempt, and a
+    # timeout really frees startup. The connection is this thread's, so it is
+    # returned here, however the load ends.
+    try:
+        public_id.load_key_sync()
+    finally:
+        connections.close_all()
+
+
+_UNDEFINED_TABLE = "42P01"
+
+
+def _load_failure_cause(exc: Exception, timeout: float) -> str | None:
+    """Why the key failed to load, when it is one of the expected reasons."""
+    if isinstance(exc, ProgrammingError) and (
+        # Django's wrapper chains the driver's error, which carries the code.
+        getattr(exc.__cause__, "sqlstate", None) == _UNDEFINED_TABLE
+    ):
+        return "its table does not exist yet; run `manage.py migrate`"
+    if isinstance(exc, TimeoutError):
+        return f"the database did not answer within {timeout:g}s"
+    if isinstance(exc, (OperationalError, InterfaceError)):
+        return "the database is unreachable"
+    return None
 
 
 if settings.GLITCHTIP_ENABLE_MCP:
@@ -477,6 +663,8 @@ application = serve_static(application)
 # Scheme and client address from X-Forwarded-Proto / X-Forwarded-For.
 # TRUSTED_PROXIES defaults to private networks. See glitchtip/proxy_headers.py.
 application = ProxyHeaders(application, os.environ.get("TRUSTED_PROXIES"))
+
+application = LoadPublicIdKey(application)
 
 # Outermost so lifespan startup reaches it at all (the vtasks wrapper consumes
 # lifespan without forwarding it inward): a pod receiving no HTTP traffic still

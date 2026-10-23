@@ -17,6 +17,7 @@ from ninja.testing import TestAsyncClient
 from apps.alerts.models import AlertRecipient, ProjectAlert
 from apps.organizations_ext.constants import OrganizationUserRole
 from apps.organizations_ext.models import Organization, OrganizationUser
+from apps.organizations_ext.public_id import encode
 from apps.projects.models import Project
 from glitchtip.api.permissions import (
     NO_ORG_ID,
@@ -34,6 +35,10 @@ from glitchtip.checks import (
     registered_models,
 )
 from glitchtip.test_utils import generators  # noqa: F401
+
+
+def public(org: Organization) -> str:
+    return str(encode(org.id))
 
 
 class OrgScopedModelDeclarationTestCase(SimpleTestCase):
@@ -326,7 +331,7 @@ class OrgScopedGateTestCase(TestCase):
 
     def test_member_cannot_delete_and_is_told_their_role(self):
         self.set_role(OrganizationUserRole.MEMBER)
-        for segment in ("orga", self.org.id):
+        for segment in ("orga", public(self.org)):
             with self.subTest(segment=segment):
                 res = self.client.delete(self.delete_url(org_slug=segment))
                 self.assertEqual(res.status_code, 403)
@@ -355,7 +360,7 @@ class OrgScopedGateTestCase(TestCase):
 
     def test_delete_cannot_reach_another_orgs_alert_through_a_shared_slug(self):
         self.set_role(OrganizationUserRole.ADMIN)
-        for segment in ("orga", self.org.id):
+        for segment in ("orga", public(self.org)):
             with self.subTest(segment=segment):
                 res = self.client.delete(
                     self.delete_url(org_slug=segment, alert_id=self.other_alert.id)
@@ -366,9 +371,9 @@ class OrgScopedGateTestCase(TestCase):
     def test_list_is_scoped_to_the_org_in_the_path(self):
         cases = [
             (self.org.slug, self.alert),
-            (self.org.id, self.alert),
+            (public(self.org), self.alert),
             (self.other_org.slug, self.other_alert),
-            (self.other_org.id, self.other_alert),
+            (public(self.other_org), self.other_alert),
         ]
         for segment, alert in cases:
             with self.subTest(segment=segment):
@@ -422,16 +427,24 @@ class OrgScopedGateTestCase(TestCase):
         )
         alert = baker.make("alerts.ProjectAlert", project=project)
         Organization.objects.filter(pk=deleted.pk).update(is_deleted=True)
+        # Under 15 digits, so "0" + its public id still fits the length cap
+        # and only the leading zero rule stops the user, who owns it.
+        short = baker.make(
+            "organizations_ext.Organization",
+            id=next(i for i in range(10**6, 10**7) if len(str(encode(i))) < 15),
+        )
+        short.add_user(self.user, OrganizationUserRole.OWNER)
 
         cases = [
-            ("deleted org by id", deleted.id),
+            ("deleted org by id", public(deleted)),
             ("deleted org by slug", "gone"),
-            ("unused id", deleted.id + 1000),
+            ("unused id", str(encode(deleted.id + 1000))),
             ("unknown slug", "no-such-org"),
-            # Past int4: refused before any query.
-            ("id past int4", str(2**31)),
-            # The user owns self.org, so only the leading zero stops them.
-            ("leading zero", f"0{self.org.id}"),
+            # Past 48 bits: refused before any decode.
+            ("id past 48 bits", str(2**48)),
+            # The user owns self.org, so only the encoding stops them.
+            ("raw internal id", str(self.org.id)),
+            ("leading zero", f"0{public(short)}"),
             # int() refuses strings past 4300 digits.
             ("huge id", "1" * 5000),
         ]
@@ -488,10 +501,13 @@ class OrgScopedGateTestCase(TestCase):
         headers = self.bearer()
         self.token.add_permission("project:read")
         # Token, page, prefetch; the gate adds nothing by id, one lookup by slug.
+        # An empty page skips the prefetch. A digit segment that names no org
+        # never falls back to a slug lookup: no slug is all digits.
         cases = [
-            (self.org.id, 3, 200),
+            (public(self.org), 3, 200),
             ("orga", 4, 200),
             ("no-such-org", 3, 200),
+            (str(self.org.id), 2, 200),
         ]
         for segment, queries, status in cases:
             with self.subTest(segment=segment), self.assertNumQueries(queries):

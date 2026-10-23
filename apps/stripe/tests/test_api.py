@@ -10,6 +10,7 @@ from model_bakery import baker
 
 from apps.organizations_ext.constants import OrganizationUserRole
 from apps.organizations_ext.models import Organization
+from apps.organizations_ext.public_id import encode
 from apps.stripe.constants import SubscriptionStatus
 from apps.stripe.models import StripeSubscription
 from apps.stripe.utils import unix_to_datetime
@@ -155,7 +156,7 @@ class StripeAPITestCase(TestCase):
         res = await self.async_client.post(
             url,
             {
-                "organization": str(self.organization.id),
+                "organization": str(encode(self.organization.id)),
                 "price": archived_price.stripe_id,
             },
             content_type="application/json",
@@ -194,7 +195,7 @@ class StripeAPITestCase(TestCase):
         even when the API path named the organization by id."""
         mock_session.return_value = {"url": "test"}
         mock_portal.return_value = {"url": "test"}
-        org_id = self.organization.id
+        org_id = str(encode(self.organization.id))
         await self.async_client.post(
             reverse("api:create_stripe_session", args=[org_id]),
             {"price": self.price.stripe_id},
@@ -268,14 +269,31 @@ class StripeAPITestCase(TestCase):
         url = reverse("api:stripe_create_subscription")
         res = await self.async_client.post(
             url,
-            {"organization": str(self.organization.id), "price": self.price.stripe_id},
+            {
+                "organization": str(encode(self.organization.id)),
+                "price": self.price.stripe_id,
+            },
             content_type="application/json",
         )
         self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["organization"], str(encode(self.organization.id)))
         mock_create_subscription.assert_called_once()
         sub = await StripeSubscription.objects.aget(stripe_id="test")
         self.assertEqual(sub.subscription_cycle_start, unix_to_datetime(period_start))
         self.assertEqual(sub.subscription_cycle_end, unix_to_datetime(period_end))
+
+    @patch("apps.stripe.api.create_subscription")
+    async def test_stripe_create_subscription_refuses_a_raw_org_id(
+        self, mock_create_subscription
+    ):
+        url = reverse("api:stripe_create_subscription")
+        res = await self.async_client.post(
+            url,
+            {"organization": str(self.organization.id), "price": self.price.stripe_id},
+            content_type="application/json",
+        )
+        self.assertEqual(res.status_code, 404)
+        mock_create_subscription.assert_not_called()
 
     async def test_stripe_create_subscription_rejects_metered_price(self):
         # The metered overage price also stores price=0 (its cost lives in
@@ -290,7 +308,7 @@ class StripeAPITestCase(TestCase):
         res = await self.async_client.post(
             url,
             {
-                "organization": str(self.organization.id),
+                "organization": str(encode(self.organization.id)),
                 "price": metered_price.stripe_id,
             },
             content_type="application/json",
