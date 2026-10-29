@@ -1,4 +1,4 @@
-"""Startup validation for the folded gate's model registry.
+"""Startup validation for the folded gate's model registry and route scopes.
 
 These checks run on ``manage.py check``, ``runserver``, ``migrate``, and in
 the test runner, so an ``org_field`` that does not reach the organization
@@ -121,3 +121,119 @@ def check_org_scoped_models(app_configs, **kwargs) -> list[Error]:
         for check in (check_org_field, check_undeleted_through)
         if (error := check(model))
     ]
+
+
+def check_scope_levels(label: str, methods, scopes, view) -> list[Error]:
+    """A read names only :read scopes, and a write admitting X:write admits X:admin.
+
+    Tokens get no hierarchy: a scope counts only where a route lists it.
+    """
+    errors = []
+    higher = sorted(s for s in scopes if s.endswith((":write", ":admin")))
+    if "GET" in methods and higher:
+        errors.append(
+            Error(
+                f"{label} is a read but admits {higher}, so a token without "
+                "the matching :read scope can read it.",
+                hint="A read route lists only :read scopes.",
+                obj=view,
+                id="glitchtip.E005",
+            )
+        )
+    for scope in sorted(scopes):
+        family, _, level = scope.partition(":")
+        if level == "write" and f"{family}:admin" not in scopes:
+            errors.append(
+                Error(
+                    f"{label} admits {scope} but not {family}:admin, so a "
+                    "token holding only the admin scope is refused.",
+                    hint=f"List {family}:admin beside {scope}.",
+                    obj=view,
+                    id="glitchtip.E006",
+                )
+            )
+    return errors
+
+
+# Authenticated reads that list no scopes, so any token that reaches them reads them.
+UNSCOPED_READS = frozenset(
+    {
+        "apps.api_tokens.api.list_api_tokens",
+        "apps.event_ingest.embed_api.get_embed_error_page",
+        "apps.files.api.get_chunk_upload_info",
+        "apps.projects.api.user_notification_alerts",
+        "apps.stripe.api.list_stripe_products",
+        "apps.users.api.generate_recovery_codes",
+        "apps.users.api.get_notifications",
+        "apps.users.api.get_user",
+        "apps.users.api.list_emails",
+        "apps.users.api.list_users",
+        "apps.wizard.api.setup_wizard_hash",
+        "glitchtip.api.api.get_instance_license",
+        "glitchtip.api.api.get_support_link",
+    }
+)
+
+
+def declared_scopes(view) -> set[frozenset]:
+    """The scope list each decorator layer of a view declares.
+
+    Read layer by layer down ``__wrapped__``: ``@wraps`` also copies an inner
+    layer's list onto the outer one, which the set folds away.
+    """
+    found = set()
+    while view is not None:
+        if scopes := vars(view).get("route_scopes"):
+            found.add(scopes)
+        view = getattr(view, "__wrapped__", None)
+    return found
+
+
+def route_scope_errors(routers, app_configs=None) -> list[Error]:
+    """Check the scope lists ``org_scoped`` and ``has_permission`` leave on views."""
+    modules = None if app_configs is None else tuple(c.name for c in app_configs)
+    errors = []
+    seen = set()
+    for prefix, router in routers:
+        for path, path_view in router.path_operations.items():
+            for operation in path_view.operations:
+                view = operation.view_func
+                # optional_slash registers one view under two paths.
+                key = (view, tuple(operation.methods))
+                if key in seen:
+                    continue
+                seen.add(key)
+                if modules is not None and not view.__module__.startswith(modules):
+                    continue
+                route = f"{prefix}/{path.lstrip('/')}"
+                label = f"{'/'.join(operation.methods)} {route}"
+                scope_lists = declared_scopes(view)
+                for scopes in scope_lists:
+                    errors += check_scope_levels(label, operation.methods, scopes, view)
+                name = f"{view.__module__}.{view.__qualname__}"
+                if (
+                    "GET" in operation.methods
+                    and not scope_lists
+                    # auth=None: a public route, which tokens can't widen.
+                    and operation.auth_param is not None
+                    and name not in UNSCOPED_READS
+                ):
+                    errors.append(
+                        Error(
+                            f"{label} is a read that lists no scopes, so every "
+                            "token can read it.",
+                            hint="Gate it with org_scoped or has_permission, or "
+                            "add it to UNSCOPED_READS in glitchtip/checks.py.",
+                            obj=view,
+                            id="glitchtip.E007",
+                        )
+                    )
+    return errors
+
+
+@register(Tags.urls)
+def check_route_scopes(app_configs, **kwargs) -> list[Error]:
+    # The API imports every app's routes, so it can only load once apps are ready.
+    from .api.api import api
+
+    return route_scope_errors(api._routers, app_configs)

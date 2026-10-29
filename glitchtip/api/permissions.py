@@ -199,6 +199,7 @@ def org_scoped(scopes: list[Scopes], model: type[OrgScopedModel]):
                 param for key, param in signature.parameters.items() if key != "qs"
             ]
         )
+        gated.route_scopes = required  # read by glitchtip.checks
         return gated
 
     return decorator
@@ -237,6 +238,7 @@ def org_scoped_list(scopes: list[Scopes], model: type[OrgScopedModel], paginatio
                 raise TypeError(f"{view.__qualname__} must return a QuerySet")
             return scope.apply(result)
 
+        gated.route_scopes = required  # read by glitchtip.checks
         return paginate(pagination)(gated) if pagination else paginate(gated)
 
     return decorator
@@ -291,6 +293,7 @@ def has_permission(permissions: list[str]):
                     raise HttpError(403, "Permission denied")
             return await f(request, *args, **kwargs)
 
+        decorated_function.route_scopes = frozenset(permissions)  # glitchtip.checks
         return decorated_function
 
     return decorator
