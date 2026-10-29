@@ -4,7 +4,6 @@ from datetime import datetime, timedelta
 
 from django.db.models import OuterRef, QuerySet, Subquery
 from django.http import Http404, HttpResponse
-from ninja.pagination import paginate
 
 from glitchtip.api.authentication import AuthHttpRequest
 from glitchtip.api.pagination import MissOnEmptyPagination
@@ -19,48 +18,27 @@ from glitchtip.partition_manager import UUID7Helper
 
 from ..models import Issue, IssueEvent, UserReport
 from ..schema import IssueEventDetailSchema, IssueEventJsonSchema, IssueEventSchema
-from ..services import is_uuid7
+from ..services import is_uuid7, issue_org_segment
 from . import router
 
 
-def get_queryset(request: AuthHttpRequest, issue_id: int | None = None):
-    user_id = request.auth.user_id
-    qs = IssueEvent.objects.filter(issue__project__organization__users=user_id)
-    if issue_id:
-        qs = qs.filter(issue_id=issue_id)
-    return qs.select_related("issue")
+def get_queryset(issue_id: int):
+    # Callers pass an issue the gate already let through.
+    return IssueEvent.objects.filter(issue_id=issue_id)
 
 
 async def get_user_report(event_id: uuid.UUID) -> UserReport | None:
     return await UserReport.objects.filter(event_id=event_id).afirst()
 
 
-async def _resolve_issue(request: AuthHttpRequest, issue_id: int) -> Issue:
-    """Resolve an issue the caller is a member of, or 404.
-
-    Everything downstream scopes by ``issue.project.organization_id``, which
-    prunes the IssueEvent hash sub-partitions without joining back to
-    organization.
-    """
-    qs = Issue.objects.filter(
-        id=issue_id, project__organization__users=request.auth.user_id
-    )
-    issue = await qs.select_related("project__organization", "index").afirst()
-    if not issue:
-        raise Http404()
-    return issue
-
-
-def _get_issue_event_queryset(
-    request: AuthHttpRequest, issue_id: int, organization_id: int
-):
+def _get_issue_event_queryset(issue_id: int, organization_id: int):
     """Hot-table queryset for one issue, annotated for prev/next navigation.
 
     ``organization_id`` is filtered in before annotating so the constant lands on
     the prev/next subqueries too - they scan the same partitioned hot table and
     would otherwise hit every hash sub-partition.
     """
-    qs = get_queryset(request, issue_id).filter(organization_id=organization_id)
+    qs = get_queryset(issue_id).filter(organization_id=organization_id)
     # Use id (UUIDv7) for prev/next navigation - enables partition pruning
     return qs.annotate(
         previous=Subquery(
@@ -70,22 +48,16 @@ def _get_issue_event_queryset(
     )
 
 
-async def _get_latest_event_for_issue(
-    request: AuthHttpRequest,
-    issue: Issue,
-    issue_id: int,
-):
+async def _get_latest_event_for_issue(issue: Issue, issue_id: int):
     """Return the latest IssueEvent for an already-resolved issue.
 
-    Shared by the bare and organization-scoped ``.../events/latest/`` routes so the
-    hash-partition pruning, the ``previous`` subquery, and the cold-storage fallback
-    live in one place. The caller is responsible for resolving ``issue``, which
-    already pins the organization - so the hot queryset is scoped by
-    ``organization_id`` alone, never by slug.
+    The caller is responsible for resolving ``issue``, which already pins the
+    organization - so the hot queryset is scoped by ``organization_id`` alone,
+    never by slug.
     """
     # Filter by organization_id to enable hash sub-partition pruning
     qs = (
-        get_queryset(request, issue_id)
+        get_queryset(issue_id)
         .filter(organization_id=issue.project.organization_id)
         .order_by("-id")
     )
@@ -96,6 +68,7 @@ async def _get_latest_event_for_issue(
     )
     event = await qs.afirst()
     if event:
+        event.issue = issue
         event.next = None  # We know the next after "latest" must be None
         event.user_report = await get_user_report(event.id)
         return event
@@ -165,17 +138,16 @@ def _get_cold_events_for_issue(
     )
 
 
-async def _get_issue_event(request: AuthHttpRequest, issue: Issue, event_id: uuid.UUID):
+async def _get_issue_event(issue: Issue, event_id: uuid.UUID):
     """Return one event for an already-resolved issue: hot table, then cold storage.
 
-    Shared by the bare and organization-scoped ``.../events/{event_id}/`` routes.
     The caller resolves ``issue`` and so pins the organization; the slug never
     reaches this far.
     """
     org_id = issue.project.organization_id
     # organization_id is already filtered in - it prunes the hash sub-partitions for
     # the event lookup and for the prev/next subqueries alike.
-    qs = _get_issue_event_queryset(request, issue.id, org_id)
+    qs = _get_issue_event_queryset(issue.id, org_id)
 
     # A UUIDv7 event_id is our own primary key; anything else is a client-provided
     # sentry SDK event_id (typically UUIDv4).
@@ -185,6 +157,7 @@ async def _get_issue_event(request: AuthHttpRequest, issue: Issue, event_id: uui
         event = await qs.filter(event_id=event_id).afirst()
 
     if event:
+        event.issue = issue
         event.user_report = await get_user_report(event.id)
         return event
 
@@ -204,16 +177,6 @@ async def _get_issue_event(request: AuthHttpRequest, issue: Issue, event_id: uui
     cold_event.next = None
     cold_event.user_report = await get_user_report(cold_event.id)
     return cold_event
-
-
-@router.get("/issues/{int:issue_id}/events/", response=list[IssueEventSchema])
-@paginate
-@has_permission(["event:read"])
-async def list_issue_event(
-    request: AuthHttpRequest, response: HttpResponse, issue_id: int
-):
-    # Order by -id (UUIDv7) for partition pruning; equivalent to -received ordering
-    return get_queryset(request, issue_id=issue_id).order_by("-id")
 
 
 @router.get(
@@ -241,16 +204,20 @@ async def list_organization_issue_event(
     )
 
 
+# GitLab error tracking calls this route, and it never sends an org.
 @router.get(
     "/issues/{int:issue_id}/events/latest/",
     response=IssueEventDetailSchema,
     by_alias=True,
+    deprecated=True,
 )
 @has_permission(["event:read"])
 async def get_latest_issue_event(request: AuthHttpRequest, issue_id: int):
-    # Resolve issue first to get organization_id for hash partition pruning
-    issue = await _resolve_issue(request, issue_id)
-    return await _get_latest_event_for_issue(request, issue, issue_id)
+    return await get_organization_latest_issue_event(
+        request,
+        organization_id_or_slug=await issue_org_segment(issue_id),
+        issue_id=issue_id,
+    )
 
 
 @router.get(
@@ -270,18 +237,7 @@ async def get_organization_latest_issue_event(
     )
     if not issue:
         raise Http404()
-    return await _get_latest_event_for_issue(request, issue, issue_id)
-
-
-@router.get(
-    "/issues/{int:issue_id}/events/{event_id}/",
-    response=IssueEventDetailSchema,
-    by_alias=True,
-)
-@has_permission(["event:read"])
-async def get_issue_event(request: AuthHttpRequest, issue_id: int, event_id: uuid.UUID):
-    issue = await _resolve_issue(request, issue_id)
-    return await _get_issue_event(request, issue, event_id)
+    return await _get_latest_event_for_issue(issue, issue_id)
 
 
 @router.get(
@@ -302,7 +258,7 @@ async def get_organization_issue_event(
     )
     if not issue:
         raise Http404()
-    return await _get_issue_event(request, issue, event_id)
+    return await _get_issue_event(issue, event_id)
 
 
 @router.get(
