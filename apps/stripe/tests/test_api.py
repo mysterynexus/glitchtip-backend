@@ -219,6 +219,7 @@ class StripeAPITestCase(TestCase):
             ("create_stripe_session", {"price": self.price.stripe_id}),
             ("stripe_billing_portal_session", {}),
             ("configure_overage", {"enabled": False}),
+            ("create_organization_subscription", {"price": self.price.stripe_id}),
         ):
             with self.subTest(name):
                 res = await self.async_client.post(
@@ -253,6 +254,30 @@ class StripeAPITestCase(TestCase):
         self.assertEqual(self.client.get(url, **headers).status_code, 200)
 
     @patch("apps.stripe.api.create_subscription")
+    async def test_deprecated_create_subscription_route(self, mock_create_subscription):
+        """The frontend still posts the organization id in the body."""
+        mock_create_subscription.return_value.id = "test"
+        mock_create_subscription.return_value.created = 1681564800
+        mock_create_subscription.return_value.start_date = 1681564800
+        mock_create_subscription.return_value.collection_method = "send_invoice"
+        item = MagicMock()
+        item.current_period_start = 1681564800
+        item.current_period_end = 1684243200
+        mock_create_subscription.return_value.items.data = [item]
+        res = await self.async_client.post(
+            reverse("api:stripe_create_subscription"),
+            {"organization": str(self.organization.id), "price": self.price.stripe_id},
+            content_type="application/json",
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["organization"], str(self.organization.id))
+        self.assertTrue(
+            await StripeSubscription.objects.filter(
+                stripe_id="test", organization=self.organization
+            ).aexists()
+        )
+
+    @patch("apps.stripe.api.create_subscription")
     async def test_stripe_create_subscription(self, mock_create_subscription):
         period_start = 1681564800
         period_end = 1684243200
@@ -265,17 +290,47 @@ class StripeAPITestCase(TestCase):
         item.current_period_end = period_end
         item.price.recurring = {"interval": "month"}
         mock_create_subscription.return_value.items.data = [item]
-        url = reverse("api:stripe_create_subscription")
+        url = reverse(
+            "api:create_organization_subscription", args=[self.organization.slug]
+        )
         res = await self.async_client.post(
-            url,
-            {"organization": str(self.organization.id), "price": self.price.stripe_id},
-            content_type="application/json",
+            url, {"price": self.price.stripe_id}, content_type="application/json"
         )
         self.assertEqual(res.status_code, 200)
         mock_create_subscription.assert_called_once()
         sub = await StripeSubscription.objects.aget(stripe_id="test")
         self.assertEqual(sub.subscription_cycle_start, unix_to_datetime(period_start))
         self.assertEqual(sub.subscription_cycle_end, unix_to_datetime(period_end))
+
+    @patch("apps.stripe.api.create_subscription")
+    def test_create_subscription_requires_org_admin_on_tokens(
+        self, mock_create_subscription
+    ):
+        token = baker.make("api_tokens.APIToken", user=self.user)
+        token.add_permission("org:read")
+        headers = {"HTTP_AUTHORIZATION": f"Bearer {token.token}"}
+        for url, data in (
+            (
+                reverse("api:stripe_create_subscription"),
+                {
+                    "organization": str(self.organization.id),
+                    "price": self.price.stripe_id,
+                },
+            ),
+            (
+                reverse(
+                    "api:create_organization_subscription",
+                    args=[self.organization.slug],
+                ),
+                {"price": self.price.stripe_id},
+            ),
+        ):
+            with self.subTest(url):
+                res = self.client.post(
+                    url, data, content_type="application/json", **headers
+                )
+                self.assertEqual(res.status_code, 403)
+        mock_create_subscription.assert_not_called()
 
     async def test_stripe_create_subscription_rejects_metered_price(self):
         # The metered overage price also stores price=0 (its cost lives in

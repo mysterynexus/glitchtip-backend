@@ -316,6 +316,33 @@ class UsersTestCase(GlitchTestCase):
         # Default deletes the row
         self.assertEqual(await UserProjectAlert.objects.acount(), 0)
 
+    async def test_alerts_update_requires_org_membership(self):
+        url = reverse("api:update_user_notification_alerts", args=["me"])
+        foreign = await baker.amake("projects.Project")
+        deleted = await baker.amake(
+            "projects.Project", organization=self.organization, is_deleted=True
+        )
+        for project_id in (str(foreign.id), str(deleted.id), "abc", "99999999999"):
+            with self.subTest(project_id=project_id):
+                res = await self.async_client.put(
+                    url, {project_id: 1}, content_type="application/json"
+                )
+                self.assertEqual(res.status_code, 404)
+        self.assertFalse(await UserProjectAlert.objects.aexists())
+
+    async def test_alerts_reset_for_a_project_left_behind(self):
+        """A preference outlives access to its project and can still be reset."""
+        url = reverse("api:update_user_notification_alerts", args=["me"])
+        foreign = await baker.amake("projects.Project")
+        await UserProjectAlert.objects.acreate(
+            user=self.user, project=foreign, status=1
+        )
+        res = await self.async_client.put(
+            url, {str(foreign.id): -1}, content_type="application/json"
+        )
+        self.assertEqual(res.status_code, 204)
+        self.assertFalse(await UserProjectAlert.objects.aexists())
+
     def test_alert_notification_recipients_default_false(self):
         User.inspect = True
         self.user.subscribe_by_default = False
