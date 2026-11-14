@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from asgiref.sync import async_to_sync
@@ -11,11 +11,14 @@ from apps.organizations_ext.models import EventCounts, Organization
 from apps.stripe.constants import SubscriptionStatus
 from apps.stripe.exceptions import StripeError
 from apps.stripe.models import StripeSubscription
+from apps.stripe.overage import metering_start, overage_active
+from apps.stripe.utils import has_metered_window
 
-from ..tasks import _cycle_quota, check_organization_throttle
+from ..tasks import _cycle_quota, check_organization_throttle, start_metering
 
 _check = async_to_sync(check_organization_throttle.func)
 _cycle_quota_sync = async_to_sync(_cycle_quota)
+_start_metering = async_to_sync(start_metering)
 
 BASE_PERIOD = object()  # _make_org: the metered item's period is the plan's
 
@@ -62,6 +65,17 @@ class MeteredThrottleTestCase(TestCase):
         cache.clear()  # the per-customer lock and the cached meter formula
         # Stripe timestamps are whole seconds, so each run measures 10s later.
         self.clock = timezone.now().replace(microsecond=0)
+        self.tick = timedelta(seconds=10)
+        # (measured at, cycle-to-date usage) for each run, so a count over any
+        # window starting after the cycle's is the usage since that point.
+        self.ledger = []
+
+    def _counts(self, usage):
+        async def count(org_id, start, end):
+            before = [u for at, u in self.ledger if at <= start]
+            return EventCounts(issue_event_count=usage - (before[-1] if before else 0))
+
+        return AsyncMock(side_effect=count)
 
     def _make_org(
         self,
@@ -117,7 +131,7 @@ class MeteredThrottleTestCase(TestCase):
         The counting window the check used is kept in ``self.counted``.
         """
         if at is None:
-            self.clock += timedelta(seconds=10)
+            self.clock += self.tick
             at = self.clock
         fetch = (
             AsyncMock(return_value=fetched)
@@ -127,7 +141,7 @@ class MeteredThrottleTestCase(TestCase):
         with (
             patch(
                 "apps.organizations_ext.tasks.get_event_counts",
-                new=AsyncMock(return_value=EventCounts(issue_event_count=usage)),
+                new=self._counts(usage),
             ) as counts,
             # ``tasks.timezone`` is django.utils.timezone itself, so this pins
             # the clock for everything the check calls (cycle math included),
@@ -145,7 +159,8 @@ class MeteredThrottleTestCase(TestCase):
         ):
             _check(org.id, bypass_cache=True)
         self.fetched = fetch
-        self.counted = counts.await_args.args[1:] if counts.await_args else None
+        self.counted = counts.await_args_list[0].args[1:] if counts.await_args else None
+        self.ledger.append((at, usage))
         return mock_meter
 
     @staticmethod
@@ -446,6 +461,182 @@ class MeteredThrottleTestCase(TestCase):
         self._run(org, 900_000).assert_not_awaited()
         mock_meter = self._run(org, 1_010_000)
         self.assertEqual(self._sent(mock_meter), 10_000)
+
+    def _switch_on(self, org, usage, cap_cents=CAP_CENTS):
+        """Switch overage on, or change its cap, as ``configure_overage`` does.
+
+        The API's own wiring, ``was_billing`` included, is pinned by
+        ``test_metering_restarts_before_the_switch`` in apps.stripe.
+        """
+        org = Organization.objects.select_related(
+            "stripe_primary_subscription__price__product"
+        ).get(id=org.id)
+        self.clock += self.tick
+        was_billing = overage_active(org) and has_metered_window(
+            org.stripe_primary_subscription
+        )
+        with (
+            patch(
+                "apps.organizations_ext.tasks.get_event_counts",
+                new=self._counts(usage),
+            ),
+            patch("apps.organizations_ext.tasks.timezone.now", return_value=self.clock),
+        ):
+            self.assertTrue(_start_metering(org, was_billing))
+        Organization.objects.filter(id=org.id).update(
+            metered_billing_enabled=True, overage_spend_cap_cents=cap_cents
+        )
+        self.ledger.append((self.clock, usage))
+
+    def _hourly(self):
+        """Run each step an hour apart, starting on the hour, so metering that
+        starts at the next whole hour starts at the next step."""
+        self.clock = self.clock.replace(minute=0, second=0)
+        self.tick = timedelta(hours=1)
+
+    def test_billing_starts_when_switched_on(self):
+        """Events the throttle let through for free while overage was off, or
+        past the cap, are never billed; what was billable stays billed, and the
+        whole cap is paid headroom from the switch."""
+
+        def toggle(enabled):
+            def step(org):
+                Organization.objects.filter(id=org.id).update(
+                    metered_billing_enabled=enabled
+                )
+
+            return step
+
+        def on(usage, cap_cents=CAP_CENTS):
+            return lambda org: self._switch_on(org, usage, cap_cents)
+
+        def sweep(usage):
+            return lambda org: self._run(org, usage)
+
+        def plan(events):
+            def step(org):
+                product = org.stripe_primary_subscription.price.product
+                product.events = events
+                product.save(update_fields=["events"])
+
+            return step
+
+        cases = [
+            # (name, enabled at start, steps, last usage swept, billed, throttle)
+            ("enabled over quota", False, [on(150_000)], 150_000, None, 0),
+            ("then usage grows", False, [on(150_000)], 160_000, 10_000, 0),
+            ("enabled under quota", False, [on(50_000)], 150_000, 50_000, 0),
+            ("cap counts from the switch", False, [on(200_000)], 300_000, 100_000, 0),
+            (
+                "toggled off and back on",
+                True,
+                [sweep(130_000), toggle(False), sweep(160_000), on(160_000)],
+                170_000,
+                40_000,
+                0,
+            ),
+            (
+                "cap raised after it was reached",
+                True,
+                [sweep(ALLOWED + 50_000), on(ALLOWED + 50_000, CAP_CENTS * 2)],
+                ALLOWED + 60_000,
+                CAP_UNITS + 10_000,
+                0,
+            ),
+            (
+                "cap raised before a sweep reported",
+                True,
+                [on(150_000, CAP_CENTS * 2)],
+                150_000,
+                50_000,
+                0,
+            ),
+            (
+                "upgraded after the switch",
+                True,
+                [
+                    sweep(150_000),
+                    toggle(False),
+                    sweep(200_000),
+                    on(200_000),
+                    plan(120_000),
+                ],
+                210_000,
+                40_000,
+                0,
+            ),
+        ]
+        for name, enabled, steps, usage, billed, throttle in cases:
+            with self.subTest(name):
+                cache.clear()
+                self.ledger = []
+                Organization.objects.all().delete()
+                StripeSubscription.objects.all().delete()
+                self._hourly()
+                org, _ = self._make_org(enabled=enabled)
+                for step in steps:
+                    step(org)
+                mock_meter = self._run(org, usage)
+                if billed is None:
+                    mock_meter.assert_not_awaited()
+                else:
+                    self.assertEqual(self._sent(mock_meter), billed)
+                self.assertEqual(self._throttle(org), throttle)
+
+    def test_the_rest_of_the_hour_is_throttled_not_billed(self):
+        # Metering starts at the next whole hour; until then the organization
+        # is on the free ramp, or toggling every hour would leave it unmetered
+        # and unthrottled.
+        self._hourly()
+        org, _ = self._make_org(enabled=False)
+        self._run(org, 180_000)
+        self.clock += timedelta(minutes=30) - self.tick
+        self._switch_on(org, 180_000)  # at :30
+        self.tick = timedelta(minutes=10)
+        self._run(org, 190_000).assert_not_awaited()
+        self.assertEqual(self._throttle(org), 50)
+        self.tick = timedelta(minutes=30)
+        self.assertEqual(self._sent(self._run(org, 200_000)), 10_000)
+        self.assertEqual(self._throttle(org), 0)
+
+    def test_switching_on_again_does_not_restart_the_ramp(self):
+        # Past the cap and past the free ramp after it: fully throttled.
+        self._hourly()
+        org, _ = self._make_org()
+        usage = ALLOWED + QUOTA + 1
+        self._run(org, usage)
+        self.assertEqual(self._throttle(org), 100)
+
+        Organization.objects.filter(id=org.id).update(metered_billing_enabled=False)
+        self._run(org, usage)
+        self._switch_on(org, usage)
+        self._run(org, usage)
+        self.assertEqual(self._throttle(org), 100)
+
+    def test_an_unbillable_gap_is_not_billed(self):
+        # The opt-in outlives a plan that can't be billed; when the plan
+        # recovers, the ramp traffic from the gap must not be billed.
+        self._hourly()
+        org, sub = self._make_org()
+        self._run(org, 120_000)
+        sub.price.price = 0
+        sub.price.save(update_fields=["price"])
+        self._run(org, 150_000).assert_not_awaited()
+        sub.price.price = 15
+        sub.price.save(update_fields=["price"])
+        self.assertEqual(self._sent(self._run(org, 160_000)), 30_000)
+
+    def test_metering_starts_at_the_next_whole_hour(self):
+        start = datetime(2026, 10, 1, tzinfo=UTC)
+        cases = [
+            (None, start),
+            (start - timedelta(days=3), start),
+            (start + timedelta(hours=5), start + timedelta(hours=5)),
+            (start + timedelta(hours=5, seconds=1), start + timedelta(hours=6)),
+        ]
+        for enabled_at, expected in cases:
+            with self.subTest(enabled_at=enabled_at):
+                self.assertEqual(metering_start(enabled_at, start), expected)
 
     def test_stale_check_does_not_restamp_the_cycle_record(self):
         org, sub = self._make_org()

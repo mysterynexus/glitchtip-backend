@@ -339,6 +339,17 @@ class Organization(OrgScopedModel, SharedBaseModel, OrganizationBase):
         default=0,
         help_text="Largest plan event quota held during that cycle.",
     )
+    # See apps.stripe.overage.metered_units.
+    overage_enabled_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When overage was last switched on or its cap raised.",
+    )
+    overage_billed_through = models.PositiveBigIntegerField(
+        default=0,
+        db_default=0,
+        help_text="Cycle usage that overage had billed through by overage_enabled_at.",
+    )
     stripe_customer_id = models.CharField(max_length=28, blank=True)
     stripe_primary_subscription = models.ForeignKey(
         "stripe.StripeSubscription",

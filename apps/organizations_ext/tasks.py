@@ -24,8 +24,12 @@ from apps.stripe.exceptions import StripeError
 from apps.stripe.overage import (
     METER_FORMULA,
     billable_units,
+    billed_units,
     cycle_quota,
+    metered_units,
+    metering_start,
     overage_active,
+    reported_units,
     units_for_budget,
 )
 from apps.stripe.utils import billing_window, has_metered_window
@@ -59,7 +63,7 @@ async def check_organization_throttle(organization_id: int, bypass_cache: bool =
     org = await Organization.objects.select_related(
         "stripe_primary_subscription__price__product"
     ).aget(id=organization_id)
-    await _check_and_update_throttle(org)
+    await check_and_update_throttle(org)
 
 
 @task
@@ -75,7 +79,7 @@ async def check_all_organizations_throttle():
             break
         for org in orgs:
             try:
-                await _check_and_update_throttle(org)
+                await check_and_update_throttle(org)
             except Exception:
                 # One organization's failure (a cache blip, a row deleted
                 # mid-sweep) must not stop throttling for every org after it.
@@ -223,7 +227,8 @@ async def _report_overage(
     a boundary can still be counting the old cycle while its timestamp would
     file the figure under the new one -- the whole prior cycle, billed again.
 
-    ``overage_units`` is usage above the cycle's quota and ``cap_units`` what
+    ``overage_units`` is the cycle's metered overage (see
+    :func:`metered_overage`) and ``cap_units`` what
     the spend cap affords. Within a cycle the cap is floored at what has
     already been billed: lowering it stops growth from that point but doesn't
     retract billed usage, or dropping the cap to a dollar on the last day would
@@ -369,7 +374,89 @@ async def _cycle_quota(org: Organization, cycle_start, plan_events: int) -> int:
     return cycle_quota(org, cycle_start, plan_events)
 
 
-async def _check_and_update_throttle(org: Organization):
+async def metered_overage(org: Organization, start, end, usage: int, quota: int) -> int:
+    """This cycle's metered overage units for ``org``, before the spend cap.
+
+    See :func:`apps.stripe.overage.metered_units`. Shared by the sweep, the
+    status view and :func:`start_metering`, so all three agree.
+    """
+    begin = metering_start(org.overage_enabled_at, start)
+    if begin == start:
+        new_events = usage
+    elif begin < min(end, timezone.now()):
+        new_events = (await get_event_counts(org.id, begin, end)).total_event_count
+    else:
+        new_events = 0
+    return metered_units(
+        usage,
+        quota,
+        new_events,
+        org.overage_billed_through,
+        org.overage_enabled_at,
+        start,
+        end,
+    )
+
+
+async def _restart_metering(
+    org: Organization, measured_at, billed: int, quota: int
+) -> None:
+    """Meter from ``measured_at``, carrying ``billed`` units above ``quota``."""
+    org.overage_enabled_at = measured_at
+    org.overage_billed_through = quota + billed
+    await Organization.objects.filter(id=org.id).aupdate(
+        overage_enabled_at=org.overage_enabled_at,
+        overage_billed_through=org.overage_billed_through,
+    )
+
+
+async def start_metering(org: Organization, was_billing: bool) -> bool:
+    """Meter ``org``'s overage from now on.
+
+    Called before overage is switched on or its cap raised, so the events the
+    throttle let through for free until now are never billed. What this cycle
+    has billed so far is carried: the figure already reported, or, if the
+    sweep was billing before this request (``was_billing``), the full billable
+    figure under the old cap, reported or not.
+
+    Returns False when the metered item's billing period is unknown or stale:
+    the carried figure belongs to a cycle, and filed under the wrong one it
+    would be billed again.
+    """
+    sub = org.stripe_primary_subscription
+    measured_at = timezone.now()
+    await _refresh_metered_period(sub, measured_at)
+    if not has_metered_window(sub):
+        return False
+    start, end = billing_window(sub)
+    if not _in_window(measured_at, start, end):
+        return False
+    (
+        org.overage_last_reported_units,
+        org.overage_last_reported_at,
+    ) = await Organization.objects.values_list(
+        "overage_last_reported_units", "overage_last_reported_at"
+    ).aget(id=org.id)
+    plan_events = sub.price.product.events or settings.GLITCHTIP_FREE_TIER_EVENTS
+    quota = cycle_quota(org, start, plan_events)
+    if was_billing:
+        usage = (await get_event_counts(org.id, start, end)).total_event_count
+        billed = billed_units(
+            org,
+            await metered_overage(org, start, end, usage, quota),
+            units_for_budget(org.overage_spend_cap_cents),
+            start,
+            end,
+        )
+    else:
+        billed = reported_units(
+            org.overage_last_reported_units, org.overage_last_reported_at, start, end
+        )
+    await _restart_metering(org, measured_at, billed, quota)
+    return True
+
+
+async def check_and_update_throttle(org: Organization):
     if not settings.BILLING_ENABLED:
         return
 
@@ -416,24 +503,49 @@ async def _check_and_update_throttle(org: Organization):
             # (has_metered_window): a total counted over the plan's window would
             # be filed under the item's, and where the two differ that bills the
             # overlap twice. Until the refresh above succeeds the organization is
-            # throttled at quota plus cap but nothing is sent.
+            # throttled as if overage were off, and nothing is sent.
             if overage_active(org) and has_metered_window(sub):
-                # Paid overage: charge for usage above the cycle's quota up to
-                # the spend cap, then resume the progressive ramp (no further
-                # charges).
+                # Paid overage: no throttle while metered usage is under the
+                # spend cap. Otherwise -- past the cap, or before metering has
+                # started after a switch -- the same ramp as with overage off,
+                # over the events let through without being billed. Billed
+                # units never go down within a cycle, so switching overage off
+                # and on, or nudging the cap, can't restart the ramp.
                 cap_units = units_for_budget(org.overage_spend_cap_cents)
-                await _report_overage(
-                    org,
-                    start,
-                    end,
-                    measured_at,
-                    max(0, total_event_count - quota),
-                    cap_units,
+                metered = await metered_overage(
+                    org, start, end, total_event_count, quota
                 )
-                org_throttle = _progressive_throttle(
-                    total_event_count, quota + cap_units, quota
-                )
+                await _report_overage(org, start, end, measured_at, metered, cap_units)
+                billed = billed_units(org, metered, cap_units, start, end)
+                metering = measured_at >= metering_start(org.overage_enabled_at, start)
+                if metering and billed < cap_units:
+                    org_throttle = 0
+                else:
+                    org_throttle = _progressive_throttle(
+                        max(0, total_event_count - quota - billed), 0, quota
+                    )
             else:
+                if (
+                    org.metered_billing_enabled
+                    and not overage_active(org)
+                    and _in_window(measured_at, start, end)
+                    and metering_start(org.overage_enabled_at, start)
+                    < metering_start(measured_at, start)
+                ):
+                    # Opted in, but the plan can't be billed (downgraded to a
+                    # free plan, unpaid): the opt-in outlives it, and when the
+                    # plan recovers, the sweep must not bill the gap.
+                    await _restart_metering(
+                        org,
+                        measured_at,
+                        reported_units(
+                            org.overage_last_reported_units,
+                            org.overage_last_reported_at,
+                            start,
+                            end,
+                        ),
+                        quota,
+                    )
                 org_throttle = _progressive_throttle(
                     total_event_count, plan_events, plan_events
                 )

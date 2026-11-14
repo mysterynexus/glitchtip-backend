@@ -17,7 +17,12 @@ from apps.organizations_ext.models import (
     get_current_period_dates,
     get_event_counts,
 )
-from apps.organizations_ext.tasks import check_organization_throttle
+from apps.organizations_ext.tasks import (
+    check_and_update_throttle,
+    check_organization_throttle,
+    metered_overage,
+    start_metering,
+)
 from apps.projects.models import (
     IssueEventProjectHourlyStatistic,
     LogProjectHourlyStatistic,
@@ -45,7 +50,7 @@ from .constants import (
 from .exceptions import StripeError
 from .models import StripePrice, StripeProduct, StripeSubscription
 from .overage import (
-    billable_units,
+    billed_units,
     cost_cents_for_units,
     cycle_quota,
     overage_active,
@@ -56,6 +61,7 @@ from .overage import (
 from .utils import (
     billing_window,
     compute_cycle,
+    has_metered_window,
     metered_item_period,
     select_subscription_items,
     unix_to_datetime,
@@ -583,14 +589,14 @@ async def overage_status(org: Organization) -> dict:
     # sticky opt-in flag.
     active = overage_active(org)
     # Quota is a separate question from eligibility: an ineligible plan (unpaid,
-    # comped, quota-less) still has whatever quota it has, and _check_and_update_
+    # comped, quota-less) still has whatever quota it has, and check_and_update_
     # throttle enforces exactly this. Deriving it from `eligible` made the card
     # report the free-tier number while a larger one was actually being enforced.
     quota = plan_events or settings.GLITCHTIP_FREE_TIER_EVENTS
 
     usage = 0
     cap_units = units_for_budget(org.overage_spend_cap_cents)
-    billed_units = 0
+    billed = 0
     period = await get_current_period_dates(org)
     if period:
         usage = (await get_event_counts(org.id, *period)).total_event_count
@@ -599,15 +605,10 @@ async def overage_status(org: Organization) -> dict:
         # cap.
         quota = cycle_quota(org, period[0], quota)
     overage_units = max(0, usage - quota)
-    reported = 0
     if period and active:
-        billed_units = billable_units(
-            overage_units,
-            cap_units,
-            org.overage_last_reported_units,
-            org.overage_last_reported_at,
-            *period,
-        )
+        overage_units = await metered_overage(org, *period, usage, quota)
+        billed = billed_units(org, overage_units, cap_units, *period)
+    reported = 0
     # Only while the item that invoices it is still attached.
     if period and sub and sub.metered_item_id:
         reported = reported_units(
@@ -625,7 +626,7 @@ async def overage_status(org: Organization) -> dict:
         "quota": quota,
         "usage": usage,
         "overage_units": overage_units,
-        "overage_cost_cents": cost_cents_for_units(billed_units),
+        "overage_cost_cents": cost_cents_for_units(billed),
         "reported_cost_cents": cost_cents_for_units(reported),
         "throttle_rate": org.event_throttle_rate,
     }
@@ -670,13 +671,18 @@ async def configure_overage(
     can't re-bill reported usage and toggling never moves the window. Dormant
     means nothing further is reported, not that the period bills zero: the
     figure already filed with Stripe this period is still invoiced, and the
-    status response says so in ``reported_cost_cents``. Either way a throttle
-    re-check is enqueued so the new headroom (or block) takes effect promptly.
+    status response says so in ``reported_cost_cents``. Switching overage on
+    or raising the cap meters from that moment only (see ``start_metering``).
+    Either way a throttle re-check is enqueued so the new headroom (or block)
+    takes effect promptly.
     """
     org = await aget_object_or_404(
         qs.select_related("stripe_primary_subscription__price__product")
     )
     sub = org.stripe_primary_subscription
+    # The sweep's own test for whether it bills, read before this request
+    # changes anything.
+    was_billing = overage_active(org) and has_metered_window(sub)
 
     if payload.enabled:
         if not overage_eligible(sub):
@@ -790,6 +796,14 @@ async def configure_overage(
                 {"detail": "Could not enable on-demand billing. Please try again."},
                 status=502,
             )
+        # Before the flag or cap changes, so no check bills under the new
+        # settings what was let through under the old ones. A lowered cap adds
+        # no headroom, so metering carries on from where it was.
+        if not lowering_cap and not await start_metering(org, was_billing):
+            return JsonResponse(
+                {"detail": "Could not enable on-demand billing. Please try again."},
+                status=503,
+            )
         org.metered_billing_enabled = True
         org.overage_spend_cap_cents = payload.cap_cents
         await org.asave(
@@ -800,6 +814,16 @@ async def configure_overage(
         # is then a flag flip, and the cap stays floored at what the cycle has
         # billed so toggling can't retract it. Nothing more is reported while
         # dormant; what was already reported this period is still invoiced.
+        # Report first: switching back on carries only what was reported, so
+        # billable usage not yet sent would otherwise be dropped.
+        # A failed report only under-bills, so it never blocks the switch.
+        if was_billing:
+            try:
+                await check_and_update_throttle(org)
+            except Exception:
+                logger.exception(
+                    "Overage report before disable failed for org %s", org.id
+                )
         org.metered_billing_enabled = False
         await org.asave(update_fields=["metered_billing_enabled"])
 

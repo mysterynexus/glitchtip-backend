@@ -11,6 +11,7 @@ background throttle task — the only code that actually sends meter events —
 can apply the same predicate the API does without importing a router module.
 """
 
+from datetime import timedelta
 from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
 
 from django.conf import settings
@@ -98,6 +99,61 @@ def cycle_quota(org, cycle_start, plan_events: int) -> int:
     if org.overage_cycle_start == cycle_start:
         return max(org.overage_cycle_quota, plan_events)
     return plan_events
+
+
+def metering_start(enabled_at, cycle_start):
+    """When the cycle starting ``cycle_start`` meters events from.
+
+    The cycle start, or, when overage was switched on (or its cap raised)
+    during the cycle, the first whole hour after that: usage is counted in
+    hourly buckets, and the next one is the first holding no events accepted
+    before the switch. Until then the organization is throttled as if
+    overage were off, or the unmetered remainder of the hour would be free
+    and unthrottled.
+    """
+    if enabled_at is None or enabled_at <= cycle_start:
+        return cycle_start
+    hour = enabled_at.replace(minute=0, second=0, microsecond=0)
+    return hour if hour == enabled_at else hour + timedelta(hours=1)
+
+
+def metered_units(
+    usage: int,
+    quota: int,
+    new_events: int,
+    billed_through: int,
+    enabled_at,
+    cycle_start,
+    cycle_end,
+) -> int:
+    """Overage units this cycle meters, before the spend cap.
+
+    Overage is billed only for events accepted while it was on: those since
+    :func:`metering_start` (``new_events``), plus what the cycle had already
+    billed when overage was last switched on, so switching it off and on
+    can't retract a bill. Events the throttle let through while it was off,
+    or past the cap before a raise, are never billed.
+
+    What was already billed is held as the cycle usage it was billed through
+    (``billed_through``), not as a count of units, so a later upgrade forgives
+    it as it forgives any overage under the smaller plan.
+    """
+    carried = 0
+    if enabled_at is not None and cycle_start <= enabled_at < cycle_end:
+        carried = max(0, billed_through - quota)
+    return min(max(0, usage - quota), carried + new_events)
+
+
+def billed_units(org, metered: int, cap_units: int, cycle_start, cycle_end) -> int:
+    """:func:`billable_units` for ``org``'s metered overage and last report."""
+    return billable_units(
+        metered,
+        cap_units,
+        org.overage_last_reported_units,
+        org.overage_last_reported_at,
+        cycle_start,
+        cycle_end,
+    )
 
 
 def billable_units(

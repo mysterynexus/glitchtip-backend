@@ -8,7 +8,8 @@ from django.utils import timezone
 from model_bakery import baker
 
 from apps.organizations_ext.constants import OrganizationUserRole
-from apps.organizations_ext.models import EventCounts
+from apps.organizations_ext.models import EventCounts, Organization
+from apps.organizations_ext.tasks import start_metering
 from apps.stripe.constants import SubscriptionStatus
 from apps.stripe.exceptions import StripeError
 from apps.stripe.models import StripeSubscription
@@ -277,6 +278,105 @@ class OverageAPITestCase(TestCase):
         self.assertEqual(self.sub.metered_period_end, period[1])
         add.assert_not_awaited()
 
+    def test_metering_restarts_before_the_switch(self):
+        """Switching on or raising the cap restarts metering before the flag or
+        cap change, with what the cycle has billed so far carried."""
+        now = timezone.now().replace(microsecond=0)
+        self.sub.metered_item_id = "si_1"
+        self.sub.metered_period_start = now - timedelta(days=5)
+        self.sub.metered_period_end = now + timedelta(days=25)
+        self.sub.save()
+        cases = [
+            # (name, enabled, cap before, cap after, seen by start_metering,
+            #  usage billed through)
+            ("switched on over quota", False, 0, 2000, (False, 0, False), QUOTA),
+            # Billable while on, though no sweep has reported it yet.
+            ("cap raised", True, 2000, 4000, (True, 2000, True), 150_000),
+        ]
+        for name, enabled, cap, new_cap, expected_seen, billed_through in cases:
+            with self.subTest(name):
+                self.org.metered_billing_enabled = enabled
+                self.org.overage_spend_cap_cents = cap
+                self.org.overage_enabled_at = None
+                self.org.save()
+                seen = []
+
+                async def checked(org, was_billing, seen=seen):
+                    row = await Organization.objects.values_list(
+                        "metered_billing_enabled", "overage_spend_cap_cents"
+                    ).aget(id=org.id)
+                    seen.append((*row, was_billing))
+                    return await start_metering(org, was_billing)
+
+                counts = AsyncMock(return_value=EventCounts(issue_event_count=150_000))
+                with (
+                    patch("apps.organizations_ext.tasks.get_event_counts", new=counts),
+                    patch("apps.stripe.api.get_event_counts", new=counts),
+                    patch("apps.stripe.api.start_metering", new=checked),
+                    patch(
+                        "apps.stripe.api.check_organization_throttle",
+                        new=MagicMock(aenqueue=AsyncMock()),
+                    ),
+                ):
+                    res = self._configure({"enabled": True, "capCents": new_cap})
+                self.assertEqual(res.status_code, 200)
+                self.assertEqual(seen, [expected_seen])
+                self.org.refresh_from_db()
+                self.assertTrue(self.org.metered_billing_enabled)
+                self.assertIsNotNone(self.org.overage_enabled_at)
+                self.assertEqual(self.org.overage_billed_through, billed_through)
+
+    def test_disable_reports_first(self):
+        # Switching back on carries only what was reported, so billable usage
+        # not yet sent must go out while overage is still on.
+        now = timezone.now().replace(microsecond=0)
+        self.sub.metered_item_id = "si_1"
+        self.sub.metered_period_start = now - timedelta(days=5)
+        self.sub.metered_period_end = now + timedelta(days=25)
+        self.sub.save()
+        self.org.metered_billing_enabled = True
+        self.org.overage_spend_cap_cents = 2000
+        self.org.save()
+        seen = []
+
+        async def check(org):
+            seen.append(
+                await Organization.objects.values_list(
+                    "metered_billing_enabled", flat=True
+                ).aget(id=org.id)
+            )
+
+        with (
+            patch("apps.stripe.api.check_and_update_throttle", new=check),
+            patch(
+                "apps.stripe.api.check_organization_throttle",
+                new=MagicMock(aenqueue=AsyncMock()),
+            ),
+        ):
+            res = self._configure({"enabled": False})
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(seen, [True])
+
+    def test_enable_refused_while_the_billing_window_is_unknown(self):
+        # Billing can't start "from now" without knowing which cycle now is in.
+        self.sub.metered_item_id = "si_1"
+        self.sub.save(update_fields=["metered_item_id"])
+        with (
+            patch(
+                "apps.stripe.models.fetch_subscription",
+                new=AsyncMock(side_effect=StripeError("unreachable", status=503)),
+            ),
+            patch(
+                "apps.stripe.api.check_organization_throttle",
+                new=MagicMock(aenqueue=AsyncMock()),
+            ),
+        ):
+            res = self._configure({"enabled": True, "capCents": 2000})
+        self.assertEqual(res.status_code, 503)
+        self.org.refresh_from_db()
+        self.assertFalse(self.org.metered_billing_enabled)
+        self.assertIsNone(self.org.overage_enabled_at)
+
     def test_enable_card_error_returns_402(self):
         # A declined card surfaces Stripe's message to the owner, not a 500.
         declined = StripeError("Your card was declined.", status=402, type="card_error")
@@ -394,6 +494,8 @@ class OverageAPITestCase(TestCase):
         # The org's own subscription carrying the item is the normal re-enable
         # state, not a second subscription.
         self.sub.metered_item_id = "si_old"
+        self.sub.metered_period_start = self.sub.current_period_start
+        self.sub.metered_period_end = self.sub.current_period_end
         self.sub.save()
         self.other_subscriptions.return_value = [
             self._stripe_subscription("sub_1", metered=True),
