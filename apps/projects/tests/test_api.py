@@ -1,11 +1,15 @@
+from datetime import datetime, timedelta
+
 from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
 from model_bakery import baker
 
+from apps.issue_events.constants import EventStatus
+from apps.issue_events.models import IssueIndex
 from apps.organizations_ext.constants import OrganizationUserRole
 
-from ..models import Project, ProjectKey
+from ..models import IssueEventProjectHourlyStatistic, Project, ProjectKey
 
 
 class ProjectsAPITestCase(TestCase):
@@ -234,6 +238,105 @@ class ProjectsAPITestCase(TestCase):
             )
         )
         self.assertEqual(res.status_code, 404)
+
+
+class ProjectSummaryAPITestCase(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = baker.make("users.user")
+        cls.organization = baker.make("organizations_ext.Organization")
+        cls.organization.add_user(cls.user, role=OrganizationUserRole.MEMBER)
+        # The user is on no team, so neither project is theirs
+        cls.project = baker.make("projects.Project", organization=cls.organization)
+        cls.quiet_project = baker.make(
+            "projects.Project", organization=cls.organization
+        )
+        cls.url = reverse("api:list_project_summaries", args=[cls.organization.slug])
+
+    def setUp(self):
+        self.async_client.force_login(self.user)
+
+    async def make_issue(self, status=EventStatus.UNRESOLVED, last_seen=None, **kwargs):
+        issue = await baker.amake("issue_events.Issue", project=self.project, **kwargs)
+        await IssueIndex.objects.filter(issue=issue).aupdate(
+            status=status, last_seen=last_seen or timezone.now()
+        )
+        return issue
+
+    async def make_stat(self, date, count, project=None):
+        await IssueEventProjectHourlyStatistic.objects.acreate(
+            project=project or self.project,
+            organization=self.organization,
+            date=date.replace(minute=0, second=0, microsecond=0),
+            count=count,
+        )
+
+    async def get(self, *project_ids):
+        return await self.async_client.get(self.url, {"project": list(project_ids)})
+
+    async def test_summary(self):
+        now = timezone.now()
+        latest = now - timedelta(hours=1)
+        await self.make_issue(last_seen=now - timedelta(days=2))
+        await self.make_issue(last_seen=latest - timedelta(minutes=5))
+        await self.make_issue(EventStatus.RESOLVED, last_seen=latest)
+        await self.make_issue(EventStatus.IGNORED, last_seen=now - timedelta(days=1))
+        await self.make_issue(is_deleted=True, last_seen=now)
+        await self.make_stat(now, 5)
+        await self.make_stat(now - timedelta(days=3), 7)
+        await self.make_stat(now - timedelta(days=14, hours=23), 2)
+        await self.make_stat(now - timedelta(days=15, hours=1), 100)
+
+        res = await self.get(self.project.id, self.quiet_project.id)
+        self.assertEqual(res.status_code, 200)
+        summary, quiet = res.json()
+        self.assertEqual(summary["id"], str(self.project.id))
+        self.assertEqual(summary["unresolved"], 2)
+        self.assertAlmostEqual(
+            datetime.fromisoformat(summary["lastSeen"]),
+            latest,
+            delta=timedelta(milliseconds=1),
+        )
+        hour = now.replace(minute=0, second=0, microsecond=0)
+        self.assertCountEqual(
+            summary["hours"],
+            [
+                [int(hour.timestamp()), 5],
+                [int((hour - timedelta(days=3)).timestamp()), 7],
+                [int((hour - timedelta(days=14, hours=23)).timestamp()), 2],
+            ],
+        )
+
+        self.assertEqual(quiet["unresolved"], 0)
+        self.assertIsNone(quiet["lastSeen"])
+        self.assertEqual(quiet["hours"], [])
+
+    async def test_other_projects_are_left_out(self):
+        other_org_project = await baker.amake("projects.Project")
+        deleted_project = await baker.amake(
+            "projects.Project", organization=self.organization, is_deleted=True
+        )
+        res = await self.get(self.project.id, other_org_project.id, deleted_project.id)
+        self.assertEqual([row["id"] for row in res.json()], [str(self.project.id)])
+
+        res = await self.get(other_org_project.id)
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json(), [])
+
+    async def test_non_member_gets_404(self):
+        await self.async_client.aforce_login(await baker.amake("users.user"))
+        res = await self.get(self.project.id)
+        self.assertEqual(res.status_code, 404)
+
+    async def test_invalid_params(self):
+        cases = {
+            "no projects": {},
+            "over 100 projects": {"project": list(range(1, 102))},
+        }
+        for name, params in cases.items():
+            with self.subTest(name):
+                res = await self.async_client.get(self.url, params)
+                self.assertEqual(res.status_code, 422)
 
 
 class TeamProjectsAPITestCase(TestCase):

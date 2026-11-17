@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from ninja import Field, ModelSchema
+from ninja import Field, ModelSchema, Schema
 from pydantic import RootModel
 
 from apps.organizations_ext.schema import OrganizationSchema
@@ -137,3 +137,14 @@ class ProjectWithKeysSchema(ProjectOrganizationSchema):
 
 class StrKeyIntValue(RootModel):
     root: dict[str, int]
+
+
+class ProjectSummaryQuery(Schema):
+    project: list[int] = Field(min_length=1, max_length=100)
+
+
+class ProjectSummarySchema(CamelSchema):
+    id: str
+    unresolved: int
+    last_seen: datetime | None
+    hours: list[list[int]]
