@@ -263,6 +263,7 @@ async def create_dif_from_read_only_file(
             dif.file = fileobj
             dif.data = {
                 "arch": metadata["arch"],
+                "kind": "debug",
                 "debug_id": normalize_debug_id(proguard_id),
                 "symbol_type": "proguard",
                 "features": ["mapping"],
