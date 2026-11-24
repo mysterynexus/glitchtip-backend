@@ -54,6 +54,7 @@ from apps.event_ingest.tests.symbolication import (
 )
 from apps.files.models import File, FileBlob
 from apps.symbolication.models import CacheKind
+from apps.symbolication.store import MB
 from glitchtip.test_utils import generators  # noqa: F401
 from glitchtip.test_utils.test_case import GlitchTestCase, GlitchTipTransactionTestCase
 
@@ -344,6 +345,28 @@ class DsymsAPIViewTestCase(GlitchTestCase):
 
         self.assertEqual(response.json(), expected_response)
         self.assertEqual(response.status_code, 400)
+
+    async def test_post_proguard_mapping_over_the_size_cap(self):
+        """Stops streaming at the cap, so nothing is stored."""
+        mapping = (PROGUARD_FIXTURES / "mapping.txt").read_bytes()
+        mapping += b"    1:1:void pad() -> a\n" * 100_000
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            zip_file.writestr(f"proguard/{self.uuid}.txt", mapping)
+        upload_file = SimpleUploadedFile("example.zip", archive.getvalue())
+
+        with patch("apps.difs.api.proguard_mapping_cap", return_value=2 * MB):
+            response = await self.async_client.post(self.url, {"file": upload_file})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json(),
+            {
+                "detail": "ProGuard mapping is too large; "
+                "this server accepts mappings up to 2 MB"
+            },
+        )
+        self.assertFalse(await DebugInformationFile.objects.aexists())
 
     async def test_post_invalid_proguard_content(self):
         """Non-UTF8 binary content inside proguard/<uuid>.txt should be rejected."""
@@ -2084,6 +2107,25 @@ class ChunkedDifAssembleTestCase(GlitchTipTransactionTestCase):
         self.assertEqual(first["state"], "error")
         self.assertEqual(first["detail"], "not a ProGuard mapping")
         task.aenqueue.assert_not_called()
+
+    def test_a_mapping_over_the_size_cap_is_refused_at_assemble(self):
+        """Without this the upload looks fine and the mapping never builds."""
+        mapping = (PROGUARD_FIXTURES / "mapping.txt").read_bytes()
+        mapping += b"    1:1:void pad() -> a\n" * 100_000
+        name = f"/proguard/{self.MAPPING_UUID}.txt"
+        for cap, state in ((len(mapping), "created"), (len(mapping) - 1, "error")):
+            with (
+                self.subTest(cap=cap),
+                patch("apps.difs.api.proguard_mapping_cap", return_value=cap),
+                patch("apps.difs.api.difs_assemble", aenqueue=AsyncMock()),
+            ):
+                _, response = self.assemble(mapping, name)
+                self.assertEqual(response["state"], state)
+        self.assertEqual(
+            response["detail"],
+            f"ProGuard mapping is {-(-len(mapping) // MB)} MB; "
+            f"this server accepts mappings up to {(len(mapping) - 1) // MB} MB",
+        )
 
     def test_the_assemble_sniff_reads_across_small_chunks(self):
         """A client may pick chunks smaller than the sniff window; judging

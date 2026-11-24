@@ -234,7 +234,7 @@ GLITCHTIP_FILE_RETENTION_DAYS = env.int(
 )
 
 
-def _megabytes_setting(name: str, default: int) -> int:
+def _megabytes_setting(name: str, default: int | None) -> int | None:
     """A whole number of MB, 0 or more. Anything else (blank, "1.5", a
     negative number) warns and falls back to the default, so a typo never
     stops the server from starting."""
@@ -247,7 +247,8 @@ def _megabytes_setting(name: str, default: int) -> int:
             raise ValueError
     except ValueError:
         warnings.warn(
-            f"{name}={raw!r} is not a whole number of MB; using {default}.",
+            f"{name}={raw!r} is not a whole number of MB; "
+            + ("ignoring it." if default is None else f"using {default}."),
             RuntimeWarning,
             stacklevel=2,
         )
@@ -270,8 +271,10 @@ GLITCHTIP_SYMBOLICATION_DISK_CACHE_MB = _megabytes_setting(
     "GLITCHTIP_SYMBOLICATION_DISK_CACHE_MB", 1024
 )
 # Peak memory one cache build may use; each kind's input cap derives from it.
+# None when unset: a default that is lowered to fit a small container. A value
+# set here is used as it is.
 GLITCHTIP_SYMBOLICATION_BUILD_MEMORY_MB = _megabytes_setting(
-    "GLITCHTIP_SYMBOLICATION_BUILD_MEMORY_MB", 700
+    "GLITCHTIP_SYMBOLICATION_BUILD_MEMORY_MB", None
 )
 GLITCHTIP_LOG_RETENTION_DAYS = env.int(
     "GLITCHTIP_LOG_RETENTION_DAYS", default=GLITCHTIP_RETENTION_DAYS

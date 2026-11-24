@@ -359,7 +359,6 @@ class ProguardCostTests(SymbolicationCostTestCase):
 
 
 class ProguardSizeCapTests(SymbolicationCostTestCase):
-    @override_settings(GLITCHTIP_SYMBOLICATION_BUILD_MEMORY_MB=0)
     def test_a_mapping_over_the_cap_is_never_built(self):
         """Over the ProGuard input cap the build is refused before
         it allocates: the row is marked failed for good, and events are
@@ -386,19 +385,21 @@ class ProguardSizeCapTests(SymbolicationCostTestCase):
                 ]
             },
         )
-        with measure_symbolication() as cost:
-            self.process([event])
-        row = SymbolicationCache.objects.get()
-        self.assertEqual(row.state, CacheState.FAILED)
-        self.assertEqual(row.attempts, MAX_ATTEMPTS)
-        self.assertIn("cap", row.error)
-        self.assertEqual(cost.cache_builds, 0)
-        self.assertEqual(cost.cache_unavailable, 1)
+        # The cap is lowered after the upload: upload refuses a mapping over it.
+        with override_settings(GLITCHTIP_SYMBOLICATION_BUILD_MEMORY_MB=0):
+            with measure_symbolication() as cost:
+                self.process([event])
+            row = SymbolicationCache.objects.get()
+            self.assertEqual(row.state, CacheState.FAILED)
+            self.assertEqual(row.attempts, MAX_ATTEMPTS)
+            self.assertIn("cap", row.error)
+            self.assertEqual(cost.cache_builds, 0)
+            self.assertEqual(cost.cache_unavailable, 1)
 
-        with measure_symbolication() as cost:
-            self.process([event | {"event_id": uuid.uuid4().hex}])
-        self.assertEqual(cost.rust_calls["ProguardCache.build_to"], 0)
-        self.assertEqual(cost.files_opened, 0)
+            with measure_symbolication() as cost:
+                self.process([event | {"event_id": uuid.uuid4().hex}])
+            self.assertEqual(cost.rust_calls["ProguardCache.build_to"], 0)
+            self.assertEqual(cost.files_opened, 0)
 
 
 class JavascriptParseCostTests(SymbolicationCostTestCase):

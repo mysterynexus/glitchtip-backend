@@ -45,6 +45,10 @@ _executor_lock = threading.Lock()
 # Cache builds at once per process.
 BUILD_CONCURRENCY = 1
 
+# The build memory budget when GLITCHTIP_SYMBOLICATION_BUILD_MEMORY_MB is not
+# set.
+DEFAULT_BUILD_MEMORY_MB = 700
+
 # Peak build memory per input byte, as measured; each input cap is the
 # build memory budget over its ratio. At the default 700 MB budget the caps
 # are 64 MB (sourcemap and minified file together), 384 MB (native debug
@@ -86,9 +90,14 @@ def container_memory_limit() -> int | None:
 
 
 def build_memory_mb() -> int:
-    """The build memory budget: the setting, lowered to a share of the
-    container's memory limit when that is smaller. Logged once when lowered."""
+    """The build memory budget: the setting if an operator set one, else the
+    default, lowered to a share of the container's memory limit when that is
+    smaller. Logged once when lowered. A budget set on purpose is not lowered:
+    it is how an operator allows larger builds in a small container."""
     budget = settings.GLITCHTIP_SYMBOLICATION_BUILD_MEMORY_MB
+    if budget is not None:
+        return budget
+    budget = DEFAULT_BUILD_MEMORY_MB
     limit = container_memory_limit()
     if limit is None:
         return budget
@@ -99,8 +108,9 @@ def build_memory_mb() -> int:
         _reported_budgets.add(share)
         logger.info(
             "Symbolication cache builds may use %d MB, %d%% of this "
-            "container's %d MB memory limit (GLITCHTIP_SYMBOLICATION_"
-            "BUILD_MEMORY_MB is %d). Larger uploads are not symbolicated.",
+            "container's %d MB memory limit (the default budget is %d MB; "
+            "set GLITCHTIP_SYMBOLICATION_BUILD_MEMORY_MB to choose another). "
+            "Larger uploads are not symbolicated.",
             share,
             round(CONTAINER_MEMORY_SHARE * 100),
             limit // MB,
@@ -112,6 +122,11 @@ def build_memory_mb() -> int:
 def input_cap(ratio: float) -> int:
     """The largest input, in bytes, whose build fits the memory budget."""
     return int(build_memory_mb() / ratio) * MB
+
+
+def proguard_mapping_cap() -> int:
+    """The largest ProGuard mapping, in bytes, that can be built into a cache."""
+    return input_cap(PROGUARD_PEAK_RATIO)
 
 
 class InputTooLarge(Exception):
@@ -140,7 +155,10 @@ def _check_input_size(row: SymbolicationCache):
         size = row.source_blob.size or 0
         cap = input_cap(SYMCACHE_PEAK_RATIO)
     else:
-        return  # gt_rust applies the ProGuard cap itself
+        # gt_rust applies the same cap as a backstop, but only after the blob
+        # is opened.
+        size = row.source_blob.size or 0
+        cap = proguard_mapping_cap()
     if size > cap:
         raise InputTooLarge(f"input is {size} bytes, cap is {cap}")
 
@@ -159,7 +177,7 @@ def _build_args(row: SymbolicationCache, source, sourcemap) -> tuple[tuple, dict
         }
     return (source,), {
         "source_digest": digest,
-        "max_mapping_bytes": input_cap(PROGUARD_PEAK_RATIO),
+        "max_mapping_bytes": proguard_mapping_cap(),
     }
 
 
