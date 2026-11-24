@@ -6,6 +6,7 @@ from django.db.models import Exists, OuterRef, QuerySet
 from django.db.utils import IntegrityError
 from django.http import HttpRequest, HttpResponse
 from django.shortcuts import aget_object_or_404
+from django.utils import timezone
 from ninja import Router, Status
 from ninja.errors import HttpError, Throttled, ValidationError
 from ninja.pagination import paginate
@@ -438,6 +439,8 @@ async def validate_token(org_user_id: int, token: str) -> OrganizationUser:
     )
     if not InvitationTokenGenerator().check_token(org_user, token):
         raise HttpError(403, "Invalid invite token")
+    if org_user.user_id is not None:
+        raise HttpError(403, "This invite has already been accepted")
     return org_user
 
 
@@ -464,9 +467,11 @@ async def accept_invite(
     """Accepts invite to organization"""
     org_user = await validate_token(org_user_id, token)
     if payload.accept_invite:
-        org_user.user = await aget_user(request)
-        org_user.email = None
-        await org_user.asave()
+        claimed = await OrganizationUser.objects.filter(
+            pk=org_user.pk, user__isnull=True
+        ).aupdate(user=await aget_user(request), email=None, modified=timezone.now())
+        if not claimed:
+            raise HttpError(403, "This invite has already been accepted")
     org_user = (
         await OrganizationUser.objects.filter(pk=org_user.pk)
         .select_related("organization__owner", "user")
