@@ -36,6 +36,7 @@ from apps.difs.stacktrace_processor import (
 )
 from apps.difs.tasks import (
     ChecksumMismatched,
+    assemble_lock_key,
     difs_create_difs,
     difs_create_file_from_chunks,
     resolve_event_stacktraces,
@@ -230,6 +231,37 @@ class DifsAssembleAPITestCase(GlitchTestCase):
             self.url, self.data, content_type="application/json"
         )
         self.assertEqual(response.json(), expected_response)
+
+    async def test_polls_during_an_assembly_queue_nothing(self):
+        for chunk in self.chunks:
+            await baker.amake("files.FileBlob", checksum=chunk)
+        expected_response = {self.checksum: {"state": "created", "missingChunks": []}}
+
+        with patch("apps.difs.api.difs_assemble", aenqueue=AsyncMock()) as task:
+            for _ in range(3):
+                response = await self.async_client.post(
+                    self.url, self.data, content_type="application/json"
+                )
+                self.assertEqual(response.json(), expected_response)
+
+        task.aenqueue.assert_awaited_once()
+
+    async def test_a_failed_enqueue_lets_the_next_poll_queue_it(self):
+        for chunk in self.chunks:
+            await baker.amake("files.FileBlob", checksum=chunk)
+        failing = AsyncMock(side_effect=ConnectionError)
+
+        with patch("apps.difs.api.difs_assemble", aenqueue=failing):
+            with self.assertRaises(ConnectionError):
+                await self.async_client.post(
+                    self.url, self.data, content_type="application/json"
+                )
+
+        with patch("apps.difs.api.difs_assemble", aenqueue=AsyncMock()) as task:
+            await self.async_client.post(
+                self.url, self.data, content_type="application/json"
+            )
+        task.aenqueue.assert_awaited_once()
 
 
 class DsymsAPIViewTestCase(GlitchTestCase):
@@ -2196,6 +2228,14 @@ class ChunkedDifAssembleTestCase(GlitchTipTransactionTestCase):
         dif = DebugInformationFile.objects.get(project=self.project)
         self.assertEqual(dif.data["symbol_type"], "native")
         self.assertEqual(dif.data["debug_id"], ELF_DEBUG_ID)
+
+    def test_an_ended_assembly_releases_its_lock(self):
+        elf = (NATIVE_FIXTURES / "crash.elf").read_bytes()
+        checksum, _ = self.assemble(elf, "crash.elf", ELF_DEBUG_ID)
+        self.assertIsNone(cache.get(assemble_lock_key(self.project.id, checksum)))
+
+        checksum, _ = self.assemble(b"not a debug file at all", "junk.bin")
+        self.assertIsNone(cache.get(assemble_lock_key(self.project.id, checksum)))
 
 
 # Breakpad symbol files, as sentry-native and crashpad tooling upload them.
