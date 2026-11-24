@@ -251,11 +251,13 @@ class DifsAssembleAPITestCase(GlitchTestCase):
             await baker.amake("files.FileBlob", checksum=chunk)
         failing = AsyncMock(side_effect=ConnectionError)
 
-        with patch("apps.difs.api.difs_assemble", aenqueue=failing):
-            with self.assertRaises(ConnectionError):
-                await self.async_client.post(
-                    self.url, self.data, content_type="application/json"
-                )
+        with (
+            patch("apps.difs.api.difs_assemble", aenqueue=failing),
+            self.assertRaises(ConnectionError),
+        ):
+            await self.async_client.post(
+                self.url, self.data, content_type="application/json"
+            )
 
         with patch("apps.difs.api.difs_assemble", aenqueue=AsyncMock()) as task:
             await self.async_client.post(
