@@ -611,7 +611,8 @@ async def _fetch_issue_hashes_raw(
     sql = """
         SELECT ih.project_id, ih.value, ih.issue_id,
                si.status AS issue__status,
-               i.resolved_in_release_id AS issue__resolved_in_release_id
+               i.resolved_in_release_id AS issue__resolved_in_release_id,
+               r.created AS issue__resolved_in_release__created
         FROM unnest(%s::bigint[], %s::uuid[], %s::int[])
             AS k(project_id, value, organization_id)
         JOIN issue_events_issuehash ih
@@ -622,6 +623,7 @@ async def _fetch_issue_hashes_raw(
             WHERE issue_id = ih.issue_id AND organization_id = k.organization_id
             LIMIT 1
         ) si ON true
+        LEFT JOIN releases_release r ON r.id = i.resolved_in_release_id
     """
     columns, rows = await fetchall_unnest(sql, list(keys), db_alias=db_alias)
     dicts = [dict(zip(columns, row)) for row in rows]
@@ -1061,6 +1063,10 @@ async def process_issue_events(
 
     issue_events: list[IssueEvent] = []
     issues_to_reopen = []
+    # Resolved-in-release candidates needing a creation-time comparison before
+    # they may reopen: (issue_id, organization_id, event_release_id,
+    # resolved_in_release_created).
+    release_reopen_candidates: list[tuple[int, int, int, datetime | None]] = []
     # Group events by time and project for event count statistics
     data_stats: defaultdict[datetime, defaultdict[int, dict]] = defaultdict(
         lambda: defaultdict(lambda: {"count": 0, "organization_id": None})
@@ -1089,13 +1095,25 @@ async def process_issue_events(
             if hash_obj["issue__status"] == EventStatus.RESOLVED:
                 resolved_in = hash_obj.get("issue__resolved_in_release_id")
                 event_release = processing_event.release_id
-                if resolved_in is None or (
-                    event_release is not None and resolved_in != event_release
-                ):
-                    # (issue_id, organization_id) so the leaf reopen below prunes
-                    # to a single hash partition.
+                if resolved_in is None:
+                    # Plain resolve: any event reopens.
                     issues_to_reopen.append(
                         (hash_obj["issue_id"], processing_event.organization_id)
+                    )
+                elif event_release is not None and event_release != resolved_in:
+                    # Resolved in a specific release ("resolve in next release"
+                    # stores the latest release at resolve time). Only an event
+                    # from a NEWER release is a regression; events from older
+                    # releases are leftover noise from builds that shipped
+                    # before the fix, and must not reopen the issue. The
+                    # creation-time comparison happens after the loop.
+                    release_reopen_candidates.append(
+                        (
+                            hash_obj["issue_id"],
+                            processing_event.organization_id,
+                            event_release,
+                            hash_obj.get("issue__resolved_in_release__created"),
+                        )
                     )
 
         if not processing_event.issue_id:
@@ -1138,6 +1156,34 @@ async def process_issue_events(
                 release_id=processing_event.release_id,
             )
         )
+
+    if release_reopen_candidates:
+        # Resolve "is the event's release newer than the fixed release?" by
+        # release creation time (when the release was first seen). Reading from
+        # the primary: the event's release row may have been created earlier in
+        # this very batch. A tie or a missing row falls back to the old
+        # reopen-on-difference behavior rather than risking a muted regression.
+        _, created_rows = await fetchall(
+            "SELECT id, created FROM releases_release WHERE id = ANY(%s)",
+            [list({candidate[2] for candidate in release_reopen_candidates})],
+            db_alias="default",
+        )
+        release_created = dict(created_rows)
+        for (
+            issue_id,
+            organization_id,
+            event_release,
+            resolved_created,
+        ) in release_reopen_candidates:
+            event_created = release_created.get(event_release)
+            if (
+                event_created is None
+                or resolved_created is None
+                or event_created >= resolved_created
+            ):
+                # (issue_id, organization_id) so the leaf reopen below prunes
+                # to a single hash partition.
+                issues_to_reopen.append((issue_id, organization_id))
 
     await update_issues(processing_events)
 
