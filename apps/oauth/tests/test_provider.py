@@ -2,6 +2,7 @@ import json
 import time
 
 from asgiref.sync import sync_to_async
+from django.core import signing
 from django.core.cache import cache
 from django.test import TestCase, override_settings
 from mcp.server.auth.provider import AccessToken, RefreshToken
@@ -70,7 +71,7 @@ class OAuthProviderAuthorizeTest(TestCase):
         from mcp.server.auth.provider import AuthorizationParams
         from pydantic import AnyUrl
 
-        info = _make_client_info()
+        info = _make_client_info(client_name="Claude")
         params = AuthorizationParams(
             state="test-state",
             scopes=["org:read"],
@@ -80,7 +81,8 @@ class OAuthProviderAuthorizeTest(TestCase):
         )
         url = await self.provider.authorize(info, params)
         self.assertIn("/oauth/authorize/", url)
-        self.assertIn("data=", url)
+        signed = url.split("data=", 1)[1]
+        self.assertEqual(signing.loads(signed)["client_name"], "Claude")
 
 
 class OAuthProviderAuthCodeFlowTest(TestCase):
