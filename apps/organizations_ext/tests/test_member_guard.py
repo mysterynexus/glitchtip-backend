@@ -120,6 +120,49 @@ class MemberGuardEndpointTestCase(TransactionTestCase):
         self.assertIn("only member", res.json()["detail"])
         self.assertTrue(User.objects.filter(id=self.user.id).exists())
 
+    def test_delete_user_owning_soft_deleted_org(self):
+        """An owner who deleted their org can delete their account right away,
+        without waiting for the async cleanup task to hard-delete the org."""
+        self.organization.is_deleted = True
+        self.organization.save(update_fields=["is_deleted"])
+
+        self.client.force_login(self.user)
+        res = self.client.delete(reverse("api:delete_user", args=["me"]))
+        self.assertEqual(res.status_code, 204)
+        self.assertFalse(User.objects.filter(id=self.user.id).exists())
+
+    def test_delete_user_owning_live_and_soft_deleted_org(self):
+        """A soft-deleted org must not mask ownership of a live one."""
+        deleted_org = baker.make("organizations_ext.Organization", is_deleted=True)
+        deleted_org.add_user(self.user)
+
+        self.client.force_login(self.user)
+        res = self.client.delete(reverse("api:delete_user", args=["me"]))
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("owner", res.json()["detail"])
+        self.assertTrue(User.objects.filter(id=self.user.id).exists())
+
+    def test_delete_user_unaffected_by_pending_invite_owner(self):
+        """An unrelated org whose owner record points at a pending invite
+        (user is NULL) must not block other users from deleting accounts."""
+        other_org = baker.make("organizations_ext.Organization")
+        other_org.add_user(baker.make("users.user"))
+        invite = baker.make(
+            "organizations_ext.OrganizationUser",
+            organization=other_org,
+            user=None,
+            email="invited@example.com",
+        )
+        OrganizationOwner.objects.filter(organization=other_org).update(
+            organization_user=invite
+        )
+        loner = baker.make("users.user")
+
+        self.client.force_login(loner)
+        res = self.client.delete(reverse("api:delete_user", args=["me"]))
+        self.assertEqual(res.status_code, 204)
+        self.assertFalse(User.objects.filter(id=loner.id).exists())
+
     def test_remove_last_member_without_owner_record(self):
         OrganizationOwner.objects.filter(organization=self.organization).delete()
 

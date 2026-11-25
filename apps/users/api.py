@@ -5,6 +5,7 @@ from allauth.mfa.utils import encrypt
 from allauth_async.account.internal.flows.email_verification import asend_confirmation
 from allauth_async.mfa.recovery_codes.internal.auth import AsyncRecoveryCodes
 from django.core.cache import cache
+from django.db.models import Exists, OuterRef
 from django.db.utils import IntegrityError
 from django.http import Http404, HttpResponse
 from django.shortcuts import aget_object_or_404
@@ -12,6 +13,7 @@ from ninja import Router, Status
 from ninja.errors import HttpError
 from ninja.pagination import paginate
 
+from apps.organizations_ext.models import OrganizationOwner
 from apps.organizations_ext.utils import is_member_guard_violation
 from apps.shared.types import MeID
 from glitchtip.api.authentication import AuthHttpRequest
@@ -88,14 +90,19 @@ async def delete_user(request: AuthHttpRequest, user_id: MeID):
         raise Http404
     user_id = request.auth.user_id
     queryset = get_user_queryset(user_id=user_id)
+    # Owners of a live org may not delete their account. Soft-deleted orgs
+    # don't count: the org is gone to the user even while the async cleanup
+    # task, which can take a while, hasn't hard-deleted it yet.
+    # Exists, not id__in: a NOT IN over a subquery that yields a NULL (an owner
+    # row pointing at a pending invite) excludes every user.
+    owns_live_org = Exists(
+        OrganizationOwner.objects.filter(
+            organization_user__user_id=OuterRef("pk"),
+            organization__is_deleted=False,
+        )
+    )
     try:
-        # exclude, not filter(isnull=True): the filter form matches a user as
-        # soon as ANY of their memberships lacks an owner record, letting an
-        # owner of one org delete their account through a plain membership in
-        # another and orphan the org they own.
-        result, _ = await queryset.exclude(
-            organizations_ext_organizationuser__organizationowner__isnull=False
-        ).adelete()
+        result, _ = await queryset.exclude(owns_live_org).adelete()
     except IntegrityError as err:
         if is_member_guard_violation(err):
             raise HttpError(
