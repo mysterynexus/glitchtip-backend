@@ -10,6 +10,7 @@ from hashlib import sha1
 
 from asgiref.sync import sync_to_async
 from django.conf import settings
+from django.core.cache import cache
 from django.core.files import File as DjangoFile
 from django.db.models import QuerySet
 from django.http import HttpResponse
@@ -41,10 +42,12 @@ from .proguard import (
 )
 from .schema import AssemblePayload, DebugFileSchema
 from .tasks import (
+    ASSEMBLE_LOCK_TTL,
     DIF_STATE_CREATED,
     DIF_STATE_ERROR,
     DIF_STATE_NOT_FOUND,
     DIF_STATE_OK,
+    assemble_lock_key,
     chunks_are_not_a_mapping,
     difs_assemble,
 )
@@ -166,7 +169,14 @@ async def difs_assemble_api(
             continue
 
         responses[checksum] = {"state": DIF_STATE_CREATED, "missingChunks": []}
-        await difs_assemble.aenqueue(project.id, name, checksum, chunks, debug_id)
+        lock_key = assemble_lock_key(project.id, checksum)
+        if not await cache.aadd(lock_key, True, ASSEMBLE_LOCK_TTL):
+            continue
+        try:
+            await difs_assemble.aenqueue(project.id, name, checksum, chunks, debug_id)
+        except BaseException:
+            await cache.adelete(lock_key)
+            raise
 
     return responses
 

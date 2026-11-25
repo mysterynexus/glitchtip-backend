@@ -49,9 +49,22 @@ DIF_STATE_OK = "ok"
 DIF_STATE_NOT_FOUND = "not_found"
 DIF_STATE_ERROR = "error"
 
+ASSEMBLE_LOCK_TTL = 60 * 60
+
+
+def assemble_lock_key(project_id, checksum) -> str:
+    return f"difs_assemble:{project_id}:{checksum}"
+
 
 @task
 async def difs_assemble(project_id, name, checksum, chunks, debug_id):
+    try:
+        await _difs_assemble(project_id, name, checksum, chunks, debug_id)
+    finally:
+        await django_cache.adelete(assemble_lock_key(project_id, checksum))
+
+
+async def _difs_assemble(project_id, name, checksum, chunks, debug_id):
     try:
         project = await Project.objects.aget(id=project_id)
 
