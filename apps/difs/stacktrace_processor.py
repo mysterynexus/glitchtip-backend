@@ -4,6 +4,7 @@ import re
 
 from gt_rust.symbolic import demangle, normalize_debug_id, parse_addr
 
+from apps.difs.flutter import dart_image_base, has_dart_frames, is_dart_footer_frame
 from apps.difs.models import DebugInformationFile
 from apps.symbolication.sources import (
     LOAD_TIMEOUT_SECONDS,
@@ -320,7 +321,13 @@ class StacktraceProcessor:
 
     @classmethod
     def resolve_stacktrace(
-        cls, event, cache, debug_id=None, exception_index=0, estimated_base=ESTIMATE
+        cls,
+        event,
+        cache,
+        debug_id=None,
+        exception_index=0,
+        estimated_base=ESTIMATE,
+        dart_image=None,
     ):
         """Resolve one exception's frames with one loaded cache: a
         ProguardCache for an Android event without native frames, otherwise
@@ -333,6 +340,11 @@ class StacktraceProcessor:
                 # In future, we need to support.
                 return
             arch = (contexts.get("device") or {}).get("arch")
+            if not arch and dart_image:
+                # Flutter events typically lack contexts.device.arch; the
+                # arch is only stated in the stack footer
+                # ("android arch: arm64 ...") or the dart_image context.
+                arch = dart_image.get("arch")
 
             exceptions = (event.get("exception") or {}).get("values")
             exception = exceptions[exception_index]
@@ -372,6 +384,7 @@ class StacktraceProcessor:
             image_addr_from_meta=image_addr_from_meta,
             exception=exception,
             estimated_base=estimated_base,
+            dart_image=dart_image,
         )
 
     @classmethod
@@ -422,6 +435,7 @@ class StacktraceProcessor:
         image_addr_from_meta=None,
         exception=None,
         estimated_base=ESTIMATE,
+        dart_image=None,
     ):
         """Resolve one stack trace's frames with ``sym_cache``.
 
@@ -454,7 +468,17 @@ class StacktraceProcessor:
                 # An SDK-supplied base beats guessing. An unparseable value
                 # falls through so estimation still runs.
                 estimated_base = meta_base
-            elif frames and not any(f.get("image_addr") for f in frames if f):
+            elif (
+                frames
+                and not any(f.get("image_addr") for f in frames if f)
+                and not has_dart_frames(frames)
+            ):
+                # Estimation never runs for Dart frames: a Dart snapshot is
+                # 10-20+ MB, far beyond the probed range, and any page-aligned
+                # slide scores just as well while mapping every frame to
+                # unrelated functions. Without exact image data (dart_image),
+                # unresolved addresses beat plausible wrong names. See
+                # apps/difs/flutter.py.
                 if precomputed is ESTIMATE:
                     # None when no base fits: those frames stay unresolved.
                     estimated_base = _estimate_image_base(
@@ -468,15 +492,27 @@ class StacktraceProcessor:
                 if frame is None:
                     resolved_frames.append(frame)
                     continue
+                if dart_image is not None and is_dart_footer_frame(frame):
+                    # Pseudo-frames of the textual footer (dso bases,
+                    # build_id, pid, "***" separator) are snapshot metadata,
+                    # not stack frames; drop them from the result.
+                    continue
                 frame = copy.copy(frame)
 
-                raw_image_addr = frame.get("image_addr")
-                image_addr = (
-                    _parse_addr_or_none(raw_image_addr)
-                    if raw_image_addr is not None
-                    else estimated_base
-                )
                 instruction_addr = _parse_addr_or_none(frame.get("instruction_addr"))
+                raw_image_addr = frame.get("image_addr")
+                if raw_image_addr is not None:
+                    image_addr = _parse_addr_or_none(raw_image_addr)
+                elif meta_base is None and dart_image is not None:
+                    # Exact Dart snapshot base; None for engine/system
+                    # addresses outside the snapshot, which this DIF cannot
+                    # resolve — keep those frames as sent.
+                    image_addr = dart_image_base(dart_image, instruction_addr)
+                    if image_addr is None:
+                        resolved_frames.append(frame)
+                        continue
+                else:
+                    image_addr = estimated_base
                 if image_addr is None or instruction_addr is None:
                     # Unparseable addresses can't resolve; keep the frame as-is.
                     resolved_frames.append(frame)

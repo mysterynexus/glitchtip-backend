@@ -10,6 +10,7 @@ from django.db.models import Q
 from django.tasks import task
 from gt_rust.symbolic import Archive, normalize_debug_id, parse_addr
 
+from apps.difs.flutter import has_dart_frames, parse_dart_image_info
 from apps.difs.models import DebugInformationFile
 from apps.difs.proguard import (
     _PROGUARD_SNIFF_BYTES,
@@ -145,6 +146,28 @@ FALLBACK_CANDIDATES = 3
 _32BIT_ARCHS = frozenset({"arm", "x86", "mips", "ppc"})
 
 
+async def _code_id_debug_ids(project_id: int, code_id: str) -> list[str]:
+    """Debug ids of the project's native DIFs whose code_id matches, newest
+    first.
+
+    An obfuscated Flutter crash that the SDK could not parse itself carries a
+    textual footer whose build_id equals the code_id of the uploaded
+    ``app.<platform>-<arch>.symbols`` file. Matching it selects that exact
+    debug file instead of the bounded newest-first scan, on projects with
+    many uploads an ingest-speed win. An unmatched code_id returns nothing
+    and the caller falls back to that scan.
+    """
+    rows = (
+        DebugInformationFile.objects.filter(project_id=project_id)
+        .exclude(Q(data__has_key="kind") & Q(data__kind__in=["src", "sources"]))
+        .exclude(data__symbol_type="proguard")
+        .filter(data__code_id=code_id)
+        .order_by("-created")
+        .values_list("data__debug_id", flat=True)[:FALLBACK_SCAN_ROWS]
+    )
+    return [debug_id async for debug_id in rows if debug_id]
+
+
 def _extract_proguard_uuids(event: ErrorIssueEventSchema) -> list[str]:
     """Normalized uuids of the ProGuard mappings the event names."""
     if not event.debug_meta:
@@ -245,6 +268,20 @@ async def resolve_event_stacktraces(
     is_android = StacktraceProcessor.is_android_event(event_json)
     native_frames = StacktraceProcessor.has_native_frames(event_json)
 
+    # Flutter/Dart (obfuscated builds): the Dart snapshot's exact image
+    # base/build_id/arch, from the dart_image context or the stack's textual
+    # footer — see apps/difs/flutter.py.
+    dart_image = parse_dart_image_info(event_json)
+    build_id = (dart_image or {}).get("build_id")
+    # Any Dart frame disables base estimation for the whole event: a Dart
+    # snapshot's dense symbols make the slide ambiguous, so only exact image
+    # data may resolve those frames.
+    event_has_dart_frames = any(
+        has_dart_frames((value.get("stacktrace") or {}).get("frames") or [])
+        for value in (event_json.get("exception") or {}).get("values") or []
+        if value
+    )
+
     # Source bundles are handled separately by resolve_jvm_source_context
     # and add_native_source_context. The has_key guard matters: in SQL,
     # NOT (data->'kind' IN (...)) is NULL, not true, for a row without a
@@ -263,9 +300,15 @@ async def resolve_event_stacktraces(
     elif native_frames:
         kind = CacheKind.SYMCACHE
         is_64bit = _is_64bit_event(event_json)
+        native_debug_ids = _extract_native_debug_ids(event)
+        if not native_debug_ids and build_id:
+            # The footer's build_id equals the symbols upload's code_id:
+            # select that exact debug file. Nothing found falls through to
+            # the bounded newest-first scan in _candidate_difs.
+            native_debug_ids = await _code_id_debug_ids(project_id, build_id)
         candidates = await _candidate_difs(
             difs.exclude(data__symbol_type="proguard"),
-            _extract_native_debug_ids(event),
+            native_debug_ids,
             accept=lambda dif: (
                 not (is_64bit and (dif.data or {}).get("arch") in _32BIT_ARCHS)
             ),
@@ -293,7 +336,7 @@ async def resolve_event_stacktraces(
             continue
         debug_id = dif.data.get("debug_id")
         estimated_base = None
-        if kind == CacheKind.SYMCACHE:
+        if kind == CacheKind.SYMCACHE and not event_has_dart_frames:
             estimated_base = await StacktraceProcessor.estimate_base_for_event(
                 event_json, cache, debug_id, exception_indexes
             )
@@ -304,6 +347,7 @@ async def resolve_event_stacktraces(
                 debug_id=debug_id,
                 exception_index=index,
                 estimated_base=estimated_base,
+                dart_image=dart_image,
             )
             if remapped_stacktrace is None or remapped_stacktrace.score <= 0:
                 continue
