@@ -31,6 +31,7 @@ from .schema import (
     ReleaseSchema,
     ReleaseUpdate,
 )
+from .tasks import cleanup_organization_release_files_task
 
 router = Router()
 
@@ -49,6 +50,7 @@ GET /organizations/{organization_slug}/releases/{version}/files/
 GET /organizations/{organization_slug}/releases/{version}/files/{file_id}/
 POST /organizations/{organization_slug}/releases/{version}/assemble/ (sentry undocumented)
 DELETE /organizations/{organization_slug}/releases/{version}/files/{file_id}/
+POST /organizations/{organization_slug}/release-files/cleanup/
 GET /projects/{organization_slug}/{project_slug}/releases/ (sentry undocumented)
 GET /projects/{organization_slug}/{project_slug}/releases/{version}/ (sentry undocumented)
 DELETE /projects/{organization_slug}/{project_slug}/releases/{version}/ (sentry undocumented)
@@ -186,6 +188,23 @@ async def delete_organization_release(
     if not result:
         raise Http404
     return Status(204, None)
+
+
+@optional_slash(
+    router,
+    "post",
+    "/organizations/{slug:organization_id_or_slug}/release-files/cleanup/",
+    response={202: None},
+)
+@org_scoped(["org:admin"], Organization)
+async def cleanup_organization_release_files(
+    request: OrgScopedHttpRequest,
+    qs: QuerySet[Organization],
+    organization_id_or_slug: str,
+):
+    organization = await aget_object_or_404(qs.only("id"))
+    await cleanup_organization_release_files_task.aenqueue(organization.id)
+    return Status(202, None)
 
 
 @router.get(
