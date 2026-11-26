@@ -8,6 +8,7 @@ from queue import SimpleQueue
 from threading import Barrier, BrokenBarrierError
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from uuid import uuid4
 
 import django
 from django.core.files.base import ContentFile
@@ -39,7 +40,7 @@ def check_parallel_symbol_uploads(binaries, test_name):
 
     from apps.api_tokens.models import APIToken
     from apps.difs.models import DebugInformationFile
-    from apps.difs.release_symbols import TARGETS, assemble_tracked_upload
+    from apps.difs.release_symbols import assemble_tracked_upload
     from apps.difs.tasks import difs_get_file_from_chunks
     from apps.files.models import File, FileBlob
     from apps.organizations_ext.models import Organization
@@ -121,11 +122,8 @@ def check_parallel_symbol_uploads(binaries, test_name):
         return file
 
     jobs = list(checksums.items())
-    with (
-        patch.dict(TARGETS, {project.slug: list(targets)}),
-        patch(
-            "apps.difs.api.assemble_tracked_upload", SimpleNamespace(aenqueue=enqueue)
-        ),
+    with patch(
+        "apps.difs.api.assemble_tracked_upload", SimpleNamespace(aenqueue=enqueue)
     ):
         preflight = run_concurrently(assemble, jobs)
         assert preflight == [
@@ -215,8 +213,10 @@ def check_cleanup_api(organization, other_organization):
 
 
 def check_release_cleanup():
+    from apps.difs.models import DebugInformationFile
     from apps.files.models import File, FileBlob
     from apps.organizations_ext.models import Organization
+    from apps.projects.models import Project
     from apps.releases.models import Release
     from apps.releases.tasks import cleanup_organization_release_files_task
     from apps.sourcecode.models import DebugSymbolBundle
@@ -240,7 +240,9 @@ def check_release_cleanup():
 
     organization = Organization.objects.create(name="Nexus Cleanup")
     other_organization = Organization.objects.create(name="Nexus Other Cleanup")
-    expired, _, _, retained = releases(organization)
+    expired, release_without_metadata, pending_release, retained = releases(
+        organization
+    )
     other_expired, _, _, other_retained = releases(other_organization)
 
     obsolete_file = release_file("expired.js")
@@ -272,6 +274,61 @@ def check_release_cleanup():
         sourcemap_file=shared_map,
     )
 
+    project = Project.objects.create(name="Native Cleanup", organization=organization)
+    for release in (expired, release_without_metadata, pending_release, retained):
+        release.projects.add(project)
+
+    def native_symbol(name, *, debug_id=None, file=None, arch="x86_64"):
+        return DebugInformationFile.objects.create(
+            project=project,
+            name=name,
+            file=file if file is not None else release_file(name),
+            data={"debug_id": debug_id or str(uuid4()), "arch": arch},
+        )
+
+    def symbol_entries(*symbols):
+        return [symbol.data | {"sha1": symbol.file.checksum} for symbol in symbols]
+
+    old_native = native_symbol("expired.debug")
+    shared_symbol = native_symbol("old-shared-id.debug")
+    retained_native = native_symbol(
+        "retained.debug", debug_id=shared_symbol.data["debug_id"]
+    )
+    unrecorded_arch = native_symbol(
+        "unrecorded-arch.debug", file=retained_native.file, arch="arm64"
+    )
+    pending_native = native_symbol("still-uploading.debug")
+    unassociated_native = native_symbol("no-release.debug")
+    expired.data = {
+        "debug_symbols": {
+            project.slug: {
+                "former-target": symbol_entries(
+                    old_native, shared_symbol, unrecorded_arch, pending_native
+                )
+            }
+        }
+    }
+    expired.save(update_fields=["data"])
+    pending_release.data = {
+        "debug_symbol_uploads": {
+            project.slug: {
+                "new-target": {
+                    "1-1": {
+                        "checksums": [pending_native.file.checksum],
+                        "complete": False,
+                    }
+                }
+            }
+        }
+    }
+    pending_release.save(update_fields=["data"])
+    retained.data = {
+        "debug_symbols": {
+            project.slug: {"another-target": symbol_entries(retained_native)}
+        }
+    }
+    retained.save(update_fields=["data"])
+
     def check_artifact(artifact, exists):
         assert File.objects.filter(pk=artifact.pk).exists() == exists, artifact.name
         assert FileBlob.objects.filter(pk=artifact.blob_id).exists() == exists, (
@@ -286,6 +343,8 @@ def check_release_cleanup():
     ).exists()
     assert not File.objects.filter(pk=obsolete_alias.pk).exists()
     check_artifact(obsolete_file, exists=False)
+    assert not DebugInformationFile.objects.filter(pk=old_native.pk).exists()
+    check_artifact(old_native.file, exists=False)
     assert DebugSymbolBundle.objects.filter(pk=other_obsolete.pk).exists()
     check_artifact(other_obsolete_file, exists=True)
 
@@ -298,6 +357,15 @@ def check_release_cleanup():
     )
     check_artifact(retained_file, exists=True)
     check_artifact(shared_map, exists=True)
+    for native in (
+        shared_symbol,
+        retained_native,
+        unrecorded_arch,
+        pending_native,
+        unassociated_native,
+    ):
+        assert DebugInformationFile.objects.filter(pk=native.pk).exists(), native.name
+        check_artifact(native.file, exists=True)
 
 
 def main():

@@ -97,7 +97,7 @@ async def difs_assemble_api(
 
     responses = {}
     files = payload.root.items()
-    upload = read_tracked_upload(request.headers, project.slug)
+    upload = read_tracked_upload(request.headers)
     if upload is not None:
         requested = set(payload.root)
         ready, _, release_id = await sync_to_async(track_upload)(

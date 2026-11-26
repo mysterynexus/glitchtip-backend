@@ -1,12 +1,9 @@
 """Associate completed native debug uploads with a release."""
 
-import json
-import os
 import re
 from dataclasses import dataclass
 
 from asgiref.sync import sync_to_async
-from django.core.exceptions import ImproperlyConfigured
 from django.db import connection, transaction
 from django.db.models import F
 from django.tasks import task
@@ -21,28 +18,6 @@ SHA1 = re.compile(r"[0-9a-f]{40}")
 ATTEMPT_ID = re.compile(r"[1-9][0-9]*-[1-9][0-9]*")
 
 
-def configured_targets():
-    try:
-        targets = json.loads(os.environ.get("GLITCHTIP_DEBUG_SYMBOL_TARGETS", "{}"))
-    except ValueError as error:
-        raise ImproperlyConfigured(
-            "GLITCHTIP_DEBUG_SYMBOL_TARGETS must be JSON"
-        ) from error
-    if not isinstance(targets, dict) or any(
-        not isinstance(project_targets, list)
-        or not project_targets
-        or any(not isinstance(target, str) or not target for target in project_targets)
-        for project_targets in targets.values()
-    ):
-        raise ImproperlyConfigured(
-            "GLITCHTIP_DEBUG_SYMBOL_TARGETS must map projects to target lists"
-        )
-    return targets
-
-
-TARGETS = configured_targets()
-
-
 @dataclass(frozen=True)
 class TrackedUpload:
     version: str
@@ -50,23 +25,18 @@ class TrackedUpload:
     attempt_id: str
 
 
-def read_tracked_upload(headers, project_slug: str) -> TrackedUpload | None:
+def read_tracked_upload(headers) -> TrackedUpload | None:
     version = headers.get("X-GlitchTip-Release")
     target = headers.get("X-GlitchTip-Build-Target")
     attempt_id = headers.get("X-GlitchTip-Upload-Id")
-    targets = TARGETS.get(project_slug)
-    if targets is None:
-        if any(value is not None for value in (version, target, attempt_id)):
-            raise HttpError(
-                422, "Release-tracked uploads are not configured for this project"
-            )
+    if version is None and target is None and attempt_id is None:
         return None
 
     max_length = Release._meta.get_field("version").max_length
     if not version or version != version.strip() or len(version) > max_length:
         raise HttpError(422, "A valid X-GlitchTip-Release is required")
-    if target not in targets:
-        raise HttpError(422, "A configured X-GlitchTip-Build-Target is required")
+    if not target or not target.strip():
+        raise HttpError(422, "A nonempty X-GlitchTip-Build-Target is required")
     if not attempt_id or len(attempt_id) > 63 or not ATTEMPT_ID.fullmatch(attempt_id):
         raise HttpError(
             422, "X-GlitchTip-Upload-Id must be a CI run ID and attempt number"

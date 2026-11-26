@@ -16,7 +16,6 @@ from django.db.models import Exists, F, OuterRef, Q, Window
 from django.db.models.functions import Coalesce, RowNumber
 
 from apps.difs.models import DebugInformationFile
-from apps.difs.release_symbols import TARGETS
 from apps.files.models import File, FileBlob
 from apps.releases.models import Release
 from apps.sourcecode.models import DebugSymbolBundle
@@ -138,24 +137,26 @@ def drain_storage_deletions(root, journal, journal_prefix):
 
 def project_symbol_manifests(release_data, project):
     if not isinstance(release_data, dict):
-        return {}
-    manifests = release_data.get("debug_symbols")
-    if not isinstance(manifests, dict) or not isinstance(manifests.get(project), dict):
-        return {}
+        return None
+    manifests = release_data.get("debug_symbols", {})
+    if not isinstance(manifests, dict) or not isinstance(
+        manifests.get(project, {}), dict
+    ):
+        return None
 
     targets = {}
-    for target, entries in manifests[project].items():
-        if not isinstance(entries, list) or not entries:
-            return {}
+    for target, entries in manifests.get(project, {}).items():
+        if not isinstance(entries, list):
+            return None
         symbols = set()
         for entry in entries:
             if not isinstance(entry, dict):
-                return {}
+                return None
             debug_id, sha1 = entry.get("debug_id"), entry.get("sha1")
             if not isinstance(debug_id, str) or not debug_id:
-                return {}
+                return None
             if not isinstance(sha1, str) or not SHA1.fullmatch(sha1):
-                return {}
+                return None
             symbols.add((debug_id, sha1))
         targets[target] = symbols
     return targets
@@ -193,27 +194,45 @@ def project_symbol_uploads(release_data, project):
     return targets
 
 
-def obsolete_native_symbols(ranked_releases, expected_targets):
-    if not expected_targets:
-        return [], set()
+def protected_native_symbols(releases, project):
+    debug_ids = set()
+    checksums = set()
+    for data in releases:
+        manifests = project_symbol_manifests(data, project)
+        uploads = project_symbol_uploads(data, project)
+        if manifests is None or uploads is None:
+            return None
+        for entries in manifests.values():
+            for debug_id, checksum in entries:
+                debug_ids.add(debug_id)
+                checksums.add(checksum)
+        # An upload can reuse an existing file before its manifest is written.
+        for attempts in uploads.values():
+            for _, attempted_checksums in attempts:
+                checksums.update(attempted_checksums)
+    return debug_ids, checksums
 
+
+def obsolete_native_symbols(ranked_releases):
     retained = defaultdict(list)
     old_symbols = defaultdict(set)
     old_checksums = defaultdict(set)
     release_rows = ranked_releases.values_list(
-        "organization_id", "version", "data", "retention_rank"
+        "organization_id", "data", "retention_rank"
     ).iterator()
-    for organization_id, version, data, rank in release_rows:
+    for organization_id, data, rank in release_rows:
         if rank <= RELEASES_TO_KEEP:
-            retained[organization_id].append((version, data))
+            retained[organization_id].append(data)
             continue
-        for project, targets in expected_targets.items():
+        projects = data.get("debug_symbols", {}) if isinstance(data, dict) else {}
+        if not isinstance(projects, dict):
+            continue
+        for project in projects:
             manifests = project_symbol_manifests(data, project)
             if not manifests:
                 continue
             uploads = project_symbol_uploads(data, project) or {}
-            for target in targets:
-                entries = manifests.get(target, ())
+            for target, entries in manifests.items():
                 old_symbols[organization_id, project].update(entries)
                 recorded_checksums = {sha1 for _, sha1 in entries}
                 for complete, checksums in uploads.get(target, ()):
@@ -227,37 +246,15 @@ def obsolete_native_symbols(ranked_releases, expected_targets):
     for (organization_id, project), symbols in old_symbols.items():
         if not symbols:
             continue
-        protected_ids = set()
-        protected_checksums = set()
-        incomplete = []
-        for version, data in retained[organization_id]:
-            manifests = project_symbol_manifests(data, project)
-            missing = set(expected_targets[project]).difference(manifests)
-            uploads = project_symbol_uploads(data, project)
-            if uploads is None:
-                incomplete.append(f"{version} (invalid upload data)")
-                continue
-            for target, attempts in uploads.items():
-                recorded_checksums = {sha1 for _, sha1 in manifests.get(target, ())}
-                if any(
-                    not complete or not recorded_checksums.issuperset(checksums)
-                    for complete, checksums in attempts
-                ):
-                    missing.add(target)
-            if missing:
-                incomplete.append(f"{version} ({', '.join(sorted(missing))})")
-            for entries in manifests.values():
-                for debug_id, checksum in entries:
-                    protected_ids.add(debug_id)
-                    protected_checksums.add(checksum)
-        if incomplete:
+        protected = protected_native_symbols(retained[organization_id], project)
+        if protected is None:
             logger.warning(
-                "Skipping native symbols for organization %d project %s. Incomplete manifests: %s",
+                "Skipping native symbols for organization %d project %s due to invalid release metadata",
                 organization_id,
                 project,
-                ", ".join(incomplete),
             )
             continue
+        protected_ids, protected_checksums = protected
 
         # A kept build can use a different object with the same Debug ID.
         # Complete tracked uploads also cover sibling objects in the same blob.
@@ -318,9 +315,7 @@ def prune_release_files(root, journal, journal_prefix, organization_id):
         }
         bundles_deleted, _ = bundles.delete()
 
-        debug_file_ids, native_file_ids = obsolete_native_symbols(
-            ranked_releases, TARGETS
-        )
+        debug_file_ids, native_file_ids = obsolete_native_symbols(ranked_releases)
         debug_files_deleted, _ = DebugInformationFile.objects.filter(
             pk__in=debug_file_ids
         ).delete()
