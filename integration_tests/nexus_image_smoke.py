@@ -1,16 +1,179 @@
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from gzip import compress
 from hashlib import sha1
 from pathlib import Path
+from queue import SimpleQueue
+from threading import Barrier, BrokenBarrierError
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import django
-from django.core.files import File as UploadedFile
 from django.core.files.base import ContentFile
 from django.core.management import call_command
 from django.urls import resolve, reverse
 from django.utils.timezone import now
+
+
+def run_concurrently(function, jobs):
+    from django.db import connections
+
+    start = Barrier(len(jobs))
+
+    def run(job):
+        start.wait(timeout=10)
+        try:
+            return function(*job)
+        finally:
+            connections.close_all()
+
+    with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+        return list(executor.map(run, jobs))
+
+
+def check_parallel_symbol_uploads(binaries, test_name):
+    from django.contrib.auth import get_user_model
+    from django.core.files.uploadedfile import SimpleUploadedFile
+    from django.test import Client
+
+    from apps.api_tokens.models import APIToken
+    from apps.difs.models import DebugInformationFile
+    from apps.difs.release_symbols import TARGETS, assemble_tracked_upload
+    from apps.difs.tasks import difs_get_file_from_chunks
+    from apps.files.models import File, FileBlob
+    from apps.organizations_ext.models import Organization
+    from apps.projects.models import Project
+    from apps.releases.models import Release
+
+    name = f"Nexus CI {test_name}"
+    organization = Organization.objects.create(name=name)
+    project = Project.objects.create(name=name, organization=organization)
+    owner = get_user_model().objects.create_user(f"{project.slug}@example.com", None)
+    organization.add_user(owner)
+    token = APIToken.objects.create(user=owner)
+    token.add_permission("project:releases")
+    release_version = "ci-release"
+    targets = {"linux-first": binaries[0], "linux-second": binaries[1]}
+    checksums = {
+        target: sha1(content).hexdigest() for target, content in targets.items()
+    }
+    auth = {"Authorization": f"Bearer {token.token}"}
+    assemble_url = reverse(
+        "api:difs_assemble_api", args=[organization.slug, project.slug]
+    )
+    chunk_url = reverse("api:chunk_upload", args=[organization.slug])
+    upload_id = "1-1"
+    callbacks = SimpleQueue()
+
+    async def enqueue(*args):
+        callbacks.put(args)
+
+    def assemble(target, checksum):
+        payload = {checksum: {"name": "ci-symbols", "chunks": [checksum]}}
+        response = Client().post(
+            assemble_url,
+            data=payload,
+            content_type="application/json",
+            headers=auth
+            | {
+                "X-GlitchTip-Release": release_version,
+                "X-GlitchTip-Build-Target": target,
+                "X-GlitchTip-Upload-Id": upload_id,
+            },
+        )
+        assert response.status_code == 200, response.content
+        return response.json()[checksum]
+
+    def upload_chunk(checksum, content):
+        response = Client().post(
+            chunk_url,
+            {"file_gzip": SimpleUploadedFile(checksum, compress(content))},
+            headers=auth,
+        )
+        assert response.status_code == 200, response.content
+
+    shared_checksum = (
+        next(iter(checksums.values())) if len(set(checksums.values())) == 1 else None
+    )
+    concurrent_storage = Barrier(2)
+    concurrent_missing_file = Barrier(2)
+    storage = FileBlob._meta.get_field("blob").storage
+    save_file = storage._save
+
+    def wait_for_second_writer(gate):
+        # The checksum lock admits only one writer. Without it, let both
+        # writers observe the miss before either can save.
+        try:
+            gate.wait(timeout=1)
+        except BrokenBarrierError:
+            pass
+
+    def save_chunk(name, content):
+        if Path(name).name == shared_checksum:
+            wait_for_second_writer(concurrent_storage)
+        return save_file(name, content)
+
+    def lookup_file(checksum, chunks):
+        file = difs_get_file_from_chunks(checksum, chunks)
+        if file is None and checksum == shared_checksum:
+            wait_for_second_writer(concurrent_missing_file)
+        return file
+
+    jobs = list(checksums.items())
+    with (
+        patch.dict(TARGETS, {project.slug: list(targets)}),
+        patch(
+            "apps.difs.api.assemble_tracked_upload", SimpleNamespace(aenqueue=enqueue)
+        ),
+    ):
+        preflight = run_concurrently(assemble, jobs)
+        assert preflight == [
+            {"state": "not_found", "missingChunks": [checksum]} for _, checksum in jobs
+        ]
+        assert callbacks.empty()
+        with patch.object(storage, "_save", save_chunk):
+            run_concurrently(
+                upload_chunk, [(checksum, targets[target]) for target, checksum in jobs]
+            )
+        accepted = run_concurrently(assemble, jobs)
+        assert accepted == [{"state": "created", "missingChunks": []}] * len(jobs)
+
+        tasks = [callbacks.get_nowait() for _ in jobs]
+        assert callbacks.empty()
+        with patch("apps.difs.tasks.difs_get_file_from_chunks", lookup_file):
+            run_concurrently(assemble_tracked_upload.call, tasks)
+
+        release = Release.objects.get(
+            organization=organization, version=release_version
+        )
+        attempts = release.data["debug_symbol_uploads"][project.slug]
+        manifests = release.data["debug_symbols"][project.slug]
+        for target, checksum in jobs:
+            assert attempts[target][upload_id] == {
+                "checksums": [checksum],
+                "complete": True,
+            }
+            symbols = manifests[target]
+            assert {symbol["sha1"] for symbol in symbols} == {checksum}
+            assert all(symbol["debug_id"] for symbol in symbols)
+
+            blob = FileBlob.objects.get(checksum=checksum)
+            path = Path(blob.blob.path)
+            assert path.read_bytes() == targets[target]
+            assert list(path.parent.glob(f"{checksum}*")) == [path]
+            artifact = File.objects.get(checksum=checksum)
+            assert artifact.blob_id == blob.pk
+            assert (
+                DebugInformationFile.objects.filter(
+                    project=project, file=artifact
+                ).count()
+                == 1
+            )
+
+        completed = run_concurrently(assemble, jobs)
+        assert completed == [{"state": "ok", "missingChunks": []}] * len(jobs)
+        assert callbacks.empty()
 
 
 def check_cleanup_api(organization, other_organization):
@@ -141,56 +304,17 @@ def main():
     os.environ.setdefault("DJANGO_SETTINGS_MODULE", "glitchtip.settings")
     django.setup()
 
-    from apps.difs.release_symbols import (
-        TrackedUpload,
-        assemble_tracked_upload,
-        track_upload,
-    )
-    from apps.files.models import FileBlob
-    from apps.organizations_ext.models import Organization
-    from apps.projects.models import Project
-    from apps.releases.models import Release
-
     call_command("check")
     call_command("init_database", verbosity=0)
     assert Path("/code/dist/index.html").is_file(), "Frontend assets are missing"
     route = resolve("/api/0/projects/nexus-ci/nexus-ci/files/difs/assemble/")
     assert route.url_name == "difs_assemble_api"
 
-    organization = Organization.objects.create(name="Nexus CI")
-    project = Project.objects.create(name="Nexus CI", organization=organization)
-    binary = Path("/tmp/glitchtip-test-symbols")
-    checksum = sha1(binary.read_bytes()).hexdigest()
-    with binary.open("rb") as source:
-        FileBlob.objects.create(
-            blob=UploadedFile(source, name=binary.name),
-            checksum=checksum,
-            size=binary.stat().st_size,
-        )
-
-    upload = TrackedUpload(
-        version="ci-release", target="server-linux", attempt_id="1-1"
+    binary = Path("/tmp/glitchtip-test-symbols").read_bytes()
+    check_parallel_symbol_uploads((binary, binary), "shared symbols")
+    check_parallel_symbol_uploads(
+        (binary + b"\x00first", binary + b"\x00second"), "distinct symbols"
     )
-    ready, complete, release_id = track_upload(project, upload, {checksum})
-    assert not ready and not complete
-    assemble_tracked_upload.call(
-        project.id,
-        binary.name,
-        checksum,
-        [checksum],
-        None,
-        release_id,
-        upload.version,
-        upload.target,
-        upload.attempt_id,
-    )
-    release = Release.objects.get(pk=release_id)
-    attempt = release.data["debug_symbol_uploads"][project.slug][upload.target][
-        upload.attempt_id
-    ]
-    assert attempt == {"checksums": [checksum], "complete": True}
-    symbols = release.data["debug_symbols"][project.slug][upload.target]
-    assert any(symbol["sha1"] == checksum and symbol["debug_id"] for symbol in symbols)
 
     check_release_cleanup()
 

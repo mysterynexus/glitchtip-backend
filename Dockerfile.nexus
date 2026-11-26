@@ -1,7 +1,8 @@
 FROM glitchtip/glitchtip:7.0.0@sha256:c245745b4179667da3aebd73fb8d4f1fd918f7d68ba07d1fd73ea688933b6e01
 
 COPY --chown=5000:5000 apps/event_ingest/process_event.py apps/event_ingest/schema.py /code/apps/event_ingest/
-COPY --chown=5000:5000 apps/difs/api.py apps/difs/release_symbols.py apps/difs/stacktrace_processor.py /code/apps/difs/
+COPY --chown=5000:5000 apps/difs/api.py apps/difs/release_symbols.py apps/difs/stacktrace_processor.py apps/difs/tasks.py /code/apps/difs/
+COPY --chown=5000:5000 apps/files/models.py /code/apps/files/
 COPY --chown=5000:5000 apps/releases/api.py apps/releases/file_cleanup.py apps/releases/tasks.py /code/apps/releases/
 COPY --chown=5000:5000 apps/releases/management/ /code/apps/releases/management/
 COPY --chown=5000:5000 apps/sourcecode/schema.py /code/apps/sourcecode/

@@ -24,7 +24,7 @@ from apps.event_ingest.schema import (
     ProguardDebugImage,
 )
 from apps.files.assemble import AssembleTask, ChunkFileState, set_assemble_status
-from apps.files.models import File, FileBlob
+from apps.files.models import File, FileBlob, lock_file_checksum
 from apps.projects.models import Project
 from apps.shared.schema.exception import StackTraceFrame
 from apps.symbolication.models import CacheKind
@@ -54,14 +54,7 @@ DIF_STATE_ERROR = "error"
 async def difs_assemble(project_id, name, checksum, chunks, debug_id):
     try:
         project = await Project.objects.aget(id=project_id)
-
-        file = await sync_to_async(difs_get_file_from_chunks)(checksum, chunks)
-        if file is None:
-            file = await sync_to_async(difs_create_file_from_chunks)(
-                name, checksum, chunks
-            )
-
-        await sync_to_async(difs_create_difs)(project, name, file, debug_id)
+        await sync_to_async(_assemble_dif)(project, name, checksum, chunks, debug_id)
 
     except ChecksumMismatched:
         getLogger().error("difs_assemble: Checksum mismatched: %s", name)
@@ -76,6 +69,18 @@ async def difs_assemble(project_id, name, checksum, chunks, debug_id):
     except Exception as err:
         getLogger().error("difs_assemble: %s", type(err).__name__)
         await _assemble_failed(project_id, checksum, "assemble failed")
+
+
+def _assemble_dif(project, name, checksum, chunks, debug_id):
+    with lock_file_checksum(checksum):
+        file = difs_get_file_from_chunks(checksum, chunks)
+        if file is None:
+            file = difs_create_file_from_chunks(name, checksum, chunks)
+
+    # Commit the file before parsing so storage stays tracked if parsing fails.
+    # Publish all debug objects together so release registration sees the full set.
+    with lock_file_checksum(checksum):
+        difs_create_difs(project, name, file, debug_id)
 
 
 async def _assemble_failed(project_id, checksum, detail: str):

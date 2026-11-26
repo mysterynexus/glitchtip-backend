@@ -1,12 +1,27 @@
 import tempfile
+from contextlib import contextmanager
 from hashlib import sha1
 
+from asgiref.sync import sync_to_async
 from django.core.files.base import File as FileObj
-from django.db import models
+from django.db import connection, models, transaction
 
 from glitchtip.base_models import CreatedModel
 
 from .exceptions import AssembleChecksumMismatch
+
+
+@contextmanager
+def lock_file_checksum(checksum: str | None):
+    # Blob storage is global. Identical bytes must share a lock across projects
+    # and across chunk uploads and DIF assembly, including separate workers.
+    with transaction.atomic():
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                [f"glitchtip:file:{checksum}"],
+            )
+        yield
 
 
 def _get_size_and_checksum(fileobj):
@@ -36,7 +51,8 @@ class FileBlob(CreatedModel):
     checksum = models.CharField(max_length=40, unique=True)
 
     @classmethod
-    async def from_files(cls, files, logger=None):
+    @sync_to_async
+    def from_files(cls, files, logger=None):
         if logger:
             logger.debug("FileBlob.from_files.start")
 
@@ -46,13 +62,15 @@ class FileBlob(CreatedModel):
             else:
                 blob_file, checksum = fileobj, None
 
-            await cls.objects.aget_or_create(
-                checksum=checksum,
-                defaults={
-                    "blob": FileObj(blob_file, name=blob_file.name),
-                    "size": blob_file.size,
-                },
-            )
+            # FileField writes the bytes before inserting the unique blob row.
+            with lock_file_checksum(checksum):
+                cls.objects.get_or_create(
+                    checksum=checksum,
+                    defaults={
+                        "blob": FileObj(blob_file, name=blob_file.name),
+                        "size": blob_file.size,
+                    },
+                )
 
     @classmethod
     def from_file(cls, fileobj):
