@@ -23,7 +23,7 @@ def main():
     from apps.releases.models import Release
 
     call_command("check")
-    call_command("migrate", interactive=False, verbosity=0)
+    call_command("init_database", verbosity=0)
     assert Path("/code/dist/index.html").is_file(), "Frontend assets are missing"
     route = resolve("/api/0/projects/nexus-ci/nexus-ci/files/difs/assemble/")
     assert route.url_name == "difs_assemble_api"
