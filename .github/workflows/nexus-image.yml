@@ -1,0 +1,67 @@
+name: Build Nexus GlitchTip image
+
+on:
+  push:
+    branches:
+      - 'nexus/**'
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/mysterynexus/glitchtip:sha-${{ github.sha }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Build image
+        run: |
+          docker build --platform linux/amd64 --file Dockerfile.nexus \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$IMAGE" .
+
+      - name: Test image with PostgreSQL
+        shell: bash
+        run: |
+          docker network create glitchtip-test
+          cleanup() {
+            docker rm -f glitchtip-test-db >/dev/null 2>&1 || true
+            docker network rm glitchtip-test >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker run --detach --name glitchtip-test-db --network glitchtip-test \
+            --env POSTGRES_HOST_AUTH_METHOD=trust postgres:18 \
+            -c max_locks_per_transaction=512
+          for ((attempt = 0; attempt < 60; attempt++)); do
+            if docker exec glitchtip-test-db pg_isready -h 127.0.0.1 -U postgres; then
+              break
+            fi
+            sleep 1
+          done
+          docker exec glitchtip-test-db pg_isready -h 127.0.0.1 -U postgres
+
+          printf 'int main(void) { return 0; }\n' | \
+            cc -g -Wl,--build-id -x c - -o "$RUNNER_TEMP/glitchtip-test-symbols"
+          docker run --rm -i --network glitchtip-test \
+            --env DATABASE_URL=postgresql://postgres@glitchtip-test-db/postgres \
+            --env SECRET_KEY=glitchtip-image-test \
+            --env VALKEY_URL= \
+            --env MEDIA_ROOT=/code/uploads \
+            --volume "$RUNNER_TEMP/glitchtip-test-symbols:/tmp/glitchtip-test-symbols:ro" \
+            "$IMAGE" python - < integration_tests/nexus_image_smoke.py
+
+      - name: Publish and verify GHCR image
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE"
+          docker pull "$IMAGE"
+          digest="$(docker image inspect "$IMAGE" --format '{{range .RepoDigests}}{{println .}}{{end}}' | grep '^ghcr\.io/mysterynexus/glitchtip@sha256:')"
+          printf 'Published `%s`.\n' "$digest" >> "$GITHUB_STEP_SUMMARY"
