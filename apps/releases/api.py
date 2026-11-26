@@ -1,8 +1,10 @@
+from asgiref.sync import sync_to_async
+from django.db import transaction
 from django.db.models import F, QuerySet
 from django.http import Http404, HttpResponse
-from django.shortcuts import aget_object_or_404
+from django.shortcuts import aget_object_or_404, get_object_or_404
 from ninja import Router, Status
-from ninja.errors import ValidationError
+from ninja.errors import HttpError, ValidationError
 
 from apps.files.models import FileBlob
 from apps.files.tasks import assemble_artifacts_task
@@ -162,9 +164,10 @@ async def update_release(
     payload: ReleaseUpdate,
 ):
     release = await aget_object_or_404(qs, version=version)
-    for attr, value in payload.dict().items():
+    updates = payload.dict()
+    for attr, value in updates.items():
         setattr(release, attr, value)
-    await release.asave()
+    await release.asave(update_fields=updates.keys())
     return await get_release_details(release.id)
 
 
@@ -290,9 +293,10 @@ async def update_project_release(
     payload: ReleaseUpdate,
 ):
     release = await aget_object_or_404(qs, projects__slug=project_slug, version=version)
-    for attr, value in payload.dict().items():
+    updates = payload.dict()
+    for attr, value in updates.items():
         setattr(release, attr, value)
-    await release.asave()
+    await release.asave(update_fields=updates.keys())
     return await get_release_details(release.id)
 
 
@@ -422,6 +426,15 @@ async def list_deploys(
     return [deploy async for deploy in Deploy.objects.filter(release=release)]
 
 
+@transaction.atomic
+def store_release_commits(qs: QuerySet[Release], version: str, commits):
+    release = get_object_or_404(qs.select_for_update(of=("self",)), version=version)
+    release.commit_count = len(commits)
+    release.data["commits"] = commits[:1000]
+    release.save(update_fields=["commit_count", "data"])
+    return release.id
+
+
 @optional_slash(
     router,
     "post",
@@ -437,12 +450,9 @@ async def create_commits(
     version: str,
     payload: list[CommitIn],
 ):
-    release = await aget_object_or_404(with_release_details(qs), version=version)
     commits = [commit.dict(by_alias=True) for commit in payload]
-    release.commit_count = len(commits)
-    release.data["commits"] = commits[:1000]
-    await release.asave(update_fields=["commit_count", "data"])
-    return release
+    release_id = await sync_to_async(store_release_commits)(qs, version, commits)
+    return await get_release_details(release_id)
 
 
 @optional_slash(
@@ -477,6 +487,11 @@ async def assemble_release(
     payload: AssembleSchema,
 ):
     organization = await aget_object_or_404(qs.only("id"))
+    if (
+        not version.strip()
+        or len(version) > Release._meta.get_field("version").max_length
+    ):
+        raise HttpError(422, "A valid release version is required")
 
     existing_chunks = [
         checksum

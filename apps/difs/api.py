@@ -39,6 +39,7 @@ from .proguard import (
     extract_proguard_id,
     extract_proguard_metadata,
 )
+from .release_symbols import assemble_tracked_upload, read_tracked_upload, track_upload
 from .schema import AssemblePayload, DebugFileSchema
 from .tasks import (
     DIF_STATE_CREATED,
@@ -95,22 +96,26 @@ async def difs_assemble_api(
     project = await aget_object_or_404(qs, slug=project_slug.lower())
 
     responses = {}
-
     files = payload.root.items()
+    upload = read_tracked_upload(request.headers, project.slug)
+    if upload is not None:
+        requested = set(payload.root)
+        ready, _, release_id = await sync_to_async(track_upload)(
+            project, upload, requested
+        )
 
     for checksum, file in files:
         chunks = file.chunks
         name = file.name
         debug_id = file.debug_id
-        debug_file = await (
-            DebugInformationFile.objects.filter(
+        exists = (
+            checksum in ready
+            if upload is not None
+            else await DebugInformationFile.objects.filter(
                 project=project, file__checksum=checksum
-            )
-            .select_related("file")
-            .afirst()
+            ).aexists()
         )
-
-        if debug_file is not None:
+        if exists:
             responses[checksum] = {
                 "state": DIF_STATE_OK,
                 "missingChunks": [],
@@ -166,7 +171,20 @@ async def difs_assemble_api(
             continue
 
         responses[checksum] = {"state": DIF_STATE_CREATED, "missingChunks": []}
-        await difs_assemble.aenqueue(project.id, name, checksum, chunks, debug_id)
+        if upload is None:
+            await difs_assemble.aenqueue(project.id, name, checksum, chunks, debug_id)
+        else:
+            await assemble_tracked_upload.aenqueue(
+                project.id,
+                name,
+                checksum,
+                chunks,
+                debug_id,
+                release_id,
+                upload.version,
+                upload.target,
+                upload.attempt_id,
+            )
 
     return responses
 

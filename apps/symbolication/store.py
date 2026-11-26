@@ -55,7 +55,6 @@ from gt_rust.symbolic import (
 from .models import CacheKind, CacheState, SymbolicationCache
 from .sources import (
     COPY_CHUNK,
-    LOAD_TIMEOUT_SECONDS,
     is_node_local,
     load_lane,
     local_path,
@@ -93,11 +92,12 @@ RAM_CACHE_IDLE_SECONDS = 600
 # Budget and TTL for caches too big for the RAM tier.
 OVERSIZED_MB = 64
 OVERSIZED_TTL_SECONDS = 10.0
+CACHE_LOAD_TIMEOUT_SECONDS = 600.0
 # Total wait, over all its caches, before an event is stored unsymbolicated.
-BUILD_WAIT_SECONDS = 5.0
+BUILD_WAIT_SECONDS = 600.0
 # Total time one ingest batch may spend waiting for builds, over all its
 # events, so a batch full of new artifacts does not stall once per event.
-BATCH_BUILD_WAIT_SECONDS = 5.0
+BATCH_BUILD_WAIT_SECONDS = 600.0
 # How long the process skips waiting for a cache an event gave up on.
 UNAVAILABLE_SECONDS = 60.0
 # Builds one organization may have outstanding before it queues no more.
@@ -695,7 +695,7 @@ async def _load_ready(row: SymbolicationCache, source: CacheSource, key):
     # others wait on.
     cache, tier, mapped = await asyncio.wait_for(
         asyncio.shield(asyncio.wrap_future(future)),
-        LOAD_TIMEOUT_SECONDS,
+        CACHE_LOAD_TIMEOUT_SECONDS,
     )
     _notify(tier if leader else "shared_load")
     return cache, mapped

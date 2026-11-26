@@ -13,7 +13,10 @@ from apps.symbolication.sources import (
     read_bundle_members,
 )
 
-alternative_arch = {"x86": ["x86", "x86_64"]}
+alternative_arch = {
+    "aarch64": ["aarch64", "arm64"],
+    "x86": ["x86", "x86_64"],
+}
 
 # SymCache lookups take a uint64 address; anything outside this range cannot be
 # probed at all and raises rather than returning no match.
@@ -24,7 +27,7 @@ UINT64_MAX = 0xFFFFFFFFFFFFFFFF
 MAX_SCORED_ADDRS = 32
 
 # Debug image types that carry a native image_addr (mirrors NativeDebugImage).
-NATIVE_IMAGE_TYPES = frozenset({"macho", "elf", "pe", "pe_dotnet", "wasm"})
+NATIVE_IMAGE_TYPES = frozenset({"macho", "elf", "pe", "pe_dotnet", "wasm", "symbolic"})
 
 
 def _parse_addr_or_none(value) -> int | None:

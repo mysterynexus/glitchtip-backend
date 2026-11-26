@@ -156,12 +156,16 @@ class JvmDebugImage(BaseModel):
 
 # Important, for some reason using Schema will cause the DebugImage union not to work
 class NativeDebugImage(BaseModel):
-    type: Literal["macho", "elf", "pe", "pe_dotnet", "wasm"]
-    debug_id: Annotated[str | None, BeforeValidator(_normalize_native_debug_id)] = None
+    type: Literal["macho", "elf", "pe", "pe_dotnet", "wasm", "symbolic"]
+    debug_id: Annotated[str | None, BeforeValidator(_normalize_native_debug_id)] = (
+        Field(default=None, validation_alias=AliasChoices("debug_id", "id"))
+    )
     debug_checksum: str | None = None
     image_addr: str | None = None
     image_size: int | None = None
-    code_file: str | None = None
+    code_file: str | None = Field(
+        default=None, validation_alias=AliasChoices("code_file", "name")
+    )
     code_id: str | None = None
 
 
@@ -192,7 +196,17 @@ DebugImage = (
 KNOWN_IGNORED_IMAGE_TYPES: frozenset[str] = frozenset()
 # Types with a model above.
 TYPED_IMAGE_TYPES = frozenset(
-    {"sourcemap", "jvm", "macho", "elf", "pe", "pe_dotnet", "wasm", "proguard"}
+    {
+        "sourcemap",
+        "jvm",
+        "macho",
+        "elf",
+        "pe",
+        "pe_dotnet",
+        "wasm",
+        "symbolic",
+        "proguard",
+    }
 )
 
 

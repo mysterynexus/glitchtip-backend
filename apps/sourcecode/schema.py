@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 
 from ninja import ModelSchema, Schema
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, field_validator
 
 from glitchtip.schema import CamelSchema
 
@@ -32,7 +32,14 @@ class ArtifactBundleAssembleIn(Schema):
     checksum: HexField
     chunks: list[HexField]
     projects: list[str]
-    version: str | None = None
+    version: str = Field(min_length=1, max_length=255)
+
+    @field_validator("version")
+    @classmethod
+    def require_nonblank_version(cls, version: str) -> str:
+        if not version.strip():
+            raise ValueError("Release version must not be blank.")
+        return version
 
 
 AssembleState = Literal["created", "error", "not_found", "assembling", "ok"]
